@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, MAIN_DB, OptionalExtension as _, params};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,8 @@ pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 pub const BLOCK_SIZE: usize = 256 * 1024;
 
 /// Version 1 had one `files` table. Version 2 has cases, evidence, pages, chunks, and search.
-const SCHEMA_VERSION: i64 = 2;
+/// Version 3 adds hearings and their transcript segments.
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V2: &str = "
     DROP TABLE IF EXISTS files;
@@ -75,6 +76,28 @@ const SCHEMA_V2: &str = "
     );
 ";
 
+const SCHEMA_V3: &str = "
+    CREATE TABLE hearings (
+        id         INTEGER PRIMARY KEY,
+        case_id    INTEGER NOT NULL REFERENCES cases(id),
+        title      TEXT    NOT NULL,
+        started_at INTEGER, -- Unix seconds, set when the recording starts
+        ended_at   INTEGER, -- Unix seconds
+        audio_path TEXT
+    );
+    CREATE INDEX hearings_case ON hearings(case_id);
+    CREATE TABLE segments (
+        id         INTEGER PRIMARY KEY,
+        hearing_id INTEGER NOT NULL REFERENCES hearings(id),
+        t_start_ms INTEGER NOT NULL, -- Position in the hearing audio
+        t_end_ms   INTEGER NOT NULL,
+        text       TEXT    NOT NULL,
+        speaker    TEXT    NOT NULL CHECK (speaker IN ('accused', 'other')),
+        final      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX segments_hearing ON segments(hearing_id);
+";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Case {
     pub id: i64,
@@ -107,6 +130,53 @@ impl AnalysisStatus {
             _ => Self::Pending,
         }
     }
+}
+
+/// One hearing of a case. The times are local, as `YYYY-MM-DD HH:MM`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hearing {
+    pub id: i64,
+    pub title: String,
+    /// `None` until the recording starts.
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    /// The WAV file of the hearing audio.
+    pub audio_path: Option<PathBuf>,
+}
+
+/// Who speaks in a segment. The user sets it; there is no automatic speaker detection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speaker {
+    Accused,
+    Other,
+}
+
+impl Speaker {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accused => "accused",
+            Self::Other => "other",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "accused" => Self::Accused,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// One transcribed part of a hearing: speech between two pauses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Segment {
+    pub id: i64,
+    pub t_start_ms: i64,
+    pub t_end_ms: i64,
+    pub text: String,
+    pub speaker: Speaker,
+    /// False while the speech continues and the text can change.
+    pub is_final: bool,
 }
 
 /// One evidence file, without its content.
@@ -184,6 +254,11 @@ const SELECT_EVIDENCE: &str = "SELECT e.id, e.name, e.mime, e.size, e.sha256, \
      (SELECT count(*) FROM evidence_pages p WHERE p.evidence_id = e.id) \
      FROM evidence e";
 
+const SELECT_HEARING: &str = "SELECT id, title, \
+     strftime('%Y-%m-%d %H:%M', started_at, 'unixepoch', 'localtime'), \
+     strftime('%Y-%m-%d %H:%M', ended_at, 'unixepoch', 'localtime'), \
+     audio_path FROM hearings";
+
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         Self::migrate(Connection::open(path)?)
@@ -198,9 +273,12 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < SCHEMA_VERSION {
-            // No data of version 1 is in use, so the migration drops the `files` table.
             let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA_V2)?;
+            if version < 2 {
+                // No data of version 1 is in use, so the migration drops the `files` table.
+                tx.execute_batch(SCHEMA_V2)?;
+            }
+            tx.execute_batch(SCHEMA_V3)?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
         }
@@ -534,6 +612,139 @@ impl Store {
         tx.execute("DELETE FROM evidence WHERE id = ?1", [id])?;
         tx.commit()
     }
+
+    /// Today in local time, as `DD/MM/YYYY`.
+    pub fn today(&self) -> rusqlite::Result<String> {
+        self.conn.query_row(
+            "SELECT strftime('%d/%m/%Y', 'now', 'localtime')",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn create_hearing(&self, case_id: i64, title: &str) -> rusqlite::Result<Hearing> {
+        self.conn.execute(
+            "INSERT INTO hearings (case_id, title) VALUES (?1, ?2)",
+            params![case_id, title],
+        )?;
+        self.hearing(self.conn.last_insert_rowid())
+    }
+
+    pub fn hearing(&self, id: i64) -> rusqlite::Result<Hearing> {
+        self.conn.query_row(
+            &format!("{SELECT_HEARING} WHERE id = ?1"),
+            [id],
+            row_to_hearing,
+        )
+    }
+
+    /// Returns the hearings of a case, newest first.
+    pub fn hearings(&self, case_id: i64) -> rusqlite::Result<Vec<Hearing>> {
+        self.conn
+            .prepare(&format!(
+                "{SELECT_HEARING} WHERE case_id = ?1 ORDER BY id DESC"
+            ))?
+            .query_map([case_id], row_to_hearing)?
+            .collect()
+    }
+
+    /// Records the start of the recording and the path of the audio file.
+    pub fn start_hearing(&self, id: i64, audio_path: &Path) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE hearings SET started_at = unixepoch(), audio_path = ?1 WHERE id = ?2",
+            params![audio_path.to_string_lossy(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn end_hearing(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE hearings SET ended_at = unixepoch() WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the hearing with its segments, then its audio file.
+    pub fn delete_hearing(&self, id: i64) -> rusqlite::Result<()> {
+        let audio_path = self.hearing(id)?.audio_path;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM segments WHERE hearing_id = ?1", [id])?;
+        tx.execute("DELETE FROM hearings WHERE id = ?1", [id])?;
+        tx.commit()?;
+        // The rows are gone, so a file that stays is only wasted space: ignore the error.
+        if let Some(path) = audio_path {
+            fs::remove_file(path).ok();
+        }
+        Ok(())
+    }
+
+    /// Adds an open segment with no text. Returns its id.
+    pub fn insert_segment(
+        &self,
+        hearing_id: i64,
+        t_start_ms: i64,
+        speaker: Speaker,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO segments (hearing_id, t_start_ms, t_end_ms, text, speaker, final)
+             VALUES (?1, ?2, ?2, '', ?3, 0)",
+            params![hearing_id, t_start_ms, speaker.as_str()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Sets the final text and the end of a segment.
+    pub fn finish_segment(&self, id: i64, text: &str, t_end_ms: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET text = ?1, t_end_ms = ?2, final = 1 WHERE id = ?3",
+            params![text, t_end_ms, id],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces the text of a segment, for example with a more accurate transcription.
+    pub fn set_segment_text(&self, id: i64, text: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET text = ?1 WHERE id = ?2",
+            params![text, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_speaker(&self, id: i64, speaker: Speaker) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET speaker = ?1 WHERE id = ?2",
+            params![speaker.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_segment(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM segments WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Returns the segments of a hearing in time order.
+    pub fn segments(&self, hearing_id: i64) -> rusqlite::Result<Vec<Segment>> {
+        self.conn
+            .prepare(
+                "SELECT id, t_start_ms, t_end_ms, text, speaker, final FROM segments
+                 WHERE hearing_id = ?1 ORDER BY t_start_ms, id",
+            )?
+            .query_map([hearing_id], |row| {
+                Ok(Segment {
+                    id: row.get(0)?,
+                    t_start_ms: row.get(1)?,
+                    t_end_ms: row.get(2)?,
+                    text: row.get(3)?,
+                    speaker: Speaker::parse(&row.get::<_, String>(4)?),
+                    is_final: row.get(5)?,
+                })
+            })?
+            .collect()
+    }
 }
 
 fn delete_analysis(conn: &Connection, id: i64) -> rusqlite::Result<()> {
@@ -577,6 +788,16 @@ pub fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+fn row_to_hearing(row: &rusqlite::Row) -> rusqlite::Result<Hearing> {
+    Ok(Hearing {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        started_at: row.get(2)?,
+        ended_at: row.get(3)?,
+        audio_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+    })
+}
+
 fn row_to_evidence(row: &rusqlite::Row) -> rusqlite::Result<Evidence> {
     Ok(Evidence {
         id: row.get(0)?,
@@ -599,7 +820,9 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use super::{AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, Store, locator_label};
+    use super::{
+        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, Speaker, Store, locator_label,
+    };
     use crate::extract::{Page, PageSource};
 
     /// A new file in its own folder, so that tests that run at the same time do not change the
@@ -993,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_database_is_migrated_to_version_2() {
+    fn a_version_1_database_is_migrated_to_the_current_version() {
         let dir = std::env::temp_dir().join(format!("nicolaw-v1-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("v1.db");
@@ -1024,7 +1247,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(old_table, 0);
     }
 
@@ -1096,5 +1319,168 @@ mod tests {
         let total = data.len() as u64;
         assert_eq!(calls, [(BLOCK_SIZE as u64, total), (total, total)]);
         assert_eq!(content, data);
+    }
+
+    #[test]
+    fn a_version_2_database_keeps_its_evidence_and_gets_hearings() {
+        let dir = std::env::temp_dir().join(format!("nicolaw-v2-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v2.db");
+        let _ = fs::remove_file(&db);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(super::SCHEMA_V2).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 2;
+             INSERT INTO cases VALUES (1, 'Caso', 0);
+             INSERT INTO evidence (id, case_id, name, mime, size, sha256, added_at, content)
+             VALUES (1, 1, 'acta.txt', 'text/plain', 1, '', 0, x'41');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        assert_eq!(store.list(1).unwrap()[0].name, "acta.txt");
+        let hearing = store.create_hearing(1, "Audiencia").unwrap();
+        assert_eq!(store.hearings(1).unwrap()[0].id, hearing.id);
+    }
+
+    #[test]
+    fn hearings_are_created_listed_newest_first_and_per_case() {
+        let (store, case) = store_with_case();
+        let other = store.create_case("Otro caso").unwrap().id;
+
+        let first = store.create_hearing(case, "Primera audiencia").unwrap();
+        let second = store.create_hearing(case, "Segunda audiencia").unwrap();
+        store
+            .create_hearing(other, "Audiencia de otro caso")
+            .unwrap();
+
+        let hearings = store.hearings(case).unwrap();
+        let titles: Vec<&str> = hearings.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(titles, ["Segunda audiencia", "Primera audiencia"]);
+        assert_eq!(hearings[1].id, first.id);
+        assert_eq!(hearings[0].id, second.id);
+        assert!(hearings[0].started_at.is_none());
+        assert!(hearings[0].ended_at.is_none());
+        assert!(hearings[0].audio_path.is_none());
+    }
+
+    #[test]
+    fn a_hearing_records_its_start_audio_path_and_end() {
+        let (store, case) = store_with_case();
+        let id = store.create_hearing(case, "Audiencia").unwrap().id;
+
+        store
+            .start_hearing(id, Path::new("/tmp/hearings/1.wav"))
+            .unwrap();
+        let started = store.hearings(case).unwrap().remove(0);
+        store.end_hearing(id).unwrap();
+        let ended = store.hearings(case).unwrap().remove(0);
+
+        assert!(started.started_at.is_some());
+        assert!(started.ended_at.is_none());
+        assert_eq!(
+            started.audio_path.as_deref(),
+            Some(Path::new("/tmp/hearings/1.wav"))
+        );
+        assert!(ended.ended_at.is_some());
+    }
+
+    #[test]
+    fn segments_go_from_open_to_final_in_time_order() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+
+        let late = store
+            .insert_segment(hearing, 5_000, Speaker::Other)
+            .unwrap();
+        let early = store
+            .insert_segment(hearing, 1_000, Speaker::Accused)
+            .unwrap();
+        let open = store.segments(hearing).unwrap();
+        store
+            .finish_segment(early, "Yo no estaba allí.", 3_500)
+            .unwrap();
+        store.set_segment_text(early, "Yo no estaba ahí.").unwrap();
+        store.set_speaker(late, Speaker::Accused).unwrap();
+        let segments = store.segments(hearing).unwrap();
+
+        assert_eq!(open.len(), 2);
+        assert!(
+            open.iter()
+                .all(|segment| !segment.is_final && segment.text.is_empty())
+        );
+        assert_eq!(segments[0].id, early);
+        assert_eq!(segments[0].t_start_ms, 1_000);
+        assert_eq!(segments[0].t_end_ms, 3_500);
+        assert_eq!(segments[0].text, "Yo no estaba ahí.");
+        assert_eq!(segments[0].speaker, Speaker::Accused);
+        assert!(segments[0].is_final);
+        assert_eq!(segments[1].id, late);
+        assert_eq!(segments[1].speaker, Speaker::Accused);
+        assert!(!segments[1].is_final);
+    }
+
+    #[test]
+    fn an_empty_segment_can_be_deleted() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let id = store.insert_segment(hearing, 0, Speaker::Other).unwrap();
+
+        store.delete_segment(id).unwrap();
+
+        assert!(store.segments(hearing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_hearing_removes_its_segments_and_its_audio_file() {
+        let (store, case) = store_with_case();
+        let audio = temp_file("hearing.wav", b"RIFF");
+        let id = store.create_hearing(case, "Audiencia").unwrap().id;
+        let kept = store.create_hearing(case, "Otra audiencia").unwrap().id;
+        store.start_hearing(id, &audio).unwrap();
+        store.insert_segment(id, 0, Speaker::Other).unwrap();
+        store.insert_segment(kept, 0, Speaker::Other).unwrap();
+
+        store.delete_hearing(id).unwrap();
+
+        let hearings = store.hearings(case).unwrap();
+        assert_eq!(hearings.len(), 1);
+        assert_eq!(hearings[0].id, kept);
+        assert!(store.segments(id).unwrap().is_empty());
+        assert_eq!(store.segments(kept).unwrap().len(), 1);
+        assert!(!audio.exists());
+    }
+
+    #[test]
+    fn delete_hearing_without_an_audio_file_succeeds() {
+        let (store, case) = store_with_case();
+        let id = store.create_hearing(case, "Audiencia").unwrap().id;
+        store
+            .start_hearing(id, Path::new("/nonexistent/nicolaw/1.wav"))
+            .unwrap();
+
+        store.delete_hearing(id).unwrap();
+
+        assert!(store.hearings(case).unwrap().is_empty());
+    }
+
+    #[test]
+    fn today_is_the_local_date_as_day_month_year() {
+        let store = Store::open_in_memory().unwrap();
+
+        let today = store.today().unwrap();
+
+        let parts: Vec<&str> = today.split('/').collect();
+        assert_eq!(
+            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            [2, 2, 4]
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.chars().all(|c| c.is_ascii_digit()))
+        );
     }
 }

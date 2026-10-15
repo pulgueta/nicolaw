@@ -48,7 +48,7 @@ pub fn type_label(name: &str) -> String {
         Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
             extension.to_uppercase()
         }
-        _ => "File".to_owned(),
+        _ => "Archivo".to_owned(),
     }
 }
 
@@ -118,6 +118,6 @@ mod tests {
     fn type_label_is_the_upper_case_extension() {
         assert_eq!(type_label("report.pdf"), "PDF");
         assert_eq!(type_label("archive.tar.gz"), "GZ");
-        assert_eq!(type_label("Makefile"), "File");
+        assert_eq!(type_label("Makefile"), "Archivo");
     }
 }

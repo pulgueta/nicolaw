@@ -1260,9 +1260,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, NewSuggestion, SCHEMA_V2,
-        Speaker, Store, SuggestionCounts, SuggestionKind, SuggestionLevel, SuggestionStatus,
-        locator_label,
+        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, NewSuggestion, SCHEMA_V2, Speaker,
+        Store, SuggestionCounts, SuggestionKind, SuggestionLevel, SuggestionStatus, locator_label,
     };
     use crate::extract::{Page, PageSource};
 

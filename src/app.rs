@@ -37,7 +37,7 @@ use gpui_kit::*;
 
 use crate::analysis;
 use crate::extract::{Page, PageSource};
-use crate::hearings::{self, HearingsEnv, HearingsView, Recording};
+use crate::hearings::{self, HearingsEnv, HearingsView, OpenEvidence, Recording};
 use crate::preview::{self, Preview};
 use crate::store::{
     AnalysisStatus, Case, Evidence, ImportError, SearchGroup, SearchHit, Store, file_name,
@@ -193,6 +193,15 @@ impl FilesView {
                         let query = state.read(cx).value().to_string();
                         this.run_search(query, window, cx);
                     }
+                },
+            ),
+            // The source of a suggestion opens the evidence at its page.
+            cx.subscribe_in(
+                &hearings,
+                window,
+                |this, _, event: &OpenEvidence, window, cx| {
+                    this.screen = Screen::Evidence;
+                    this.open_page(event.evidence_id, event.page, window, cx);
                 },
             ),
         ];
@@ -738,10 +747,22 @@ impl FilesView {
 
     /// Selects the evidence of the hit and shows its text at the page of the hit.
     fn open_hit(&mut self, hit: &SearchHit, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(hit.evidence_id, window, cx);
+        self.open_page(hit.evidence_id, hit.page, window, cx);
         self.selected_hit = Some(hit.chunk_id);
+    }
+
+    /// Selects the evidence and shows its text at the page.
+    fn open_page(
+        &mut self,
+        evidence_id: i64,
+        page: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select(evidence_id, window, cx);
+        self.selected_hit = None;
         self.tab = Tab::Text;
-        self.focus_page = Some(hit.page);
+        self.focus_page = Some(page);
         self.scroll_to_focus_page();
         cx.notify();
     }
@@ -1829,14 +1850,23 @@ mod tests {
     use crate::extract::{Page, PageSource};
     use crate::hearings::HearingsEnv;
     use crate::models::{ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model};
-    use crate::store::{AnalysisStatus, Store};
+    use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
+    use crate::store::{AnalysisStatus, NewSuggestion, Speaker, Store, SuggestionLevel};
 
     const WAIT: Duration = Duration::from_secs(1);
 
     fn open(store: Store, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<FilesView>) {
         let dir = temp_dir("hearings-env");
+        let review = FakeReviewBackend::new(
+            FakeLlm::new("[]", "{}"),
+            FakeNli {
+                word: String::new(),
+                contradiction: 0.0,
+            },
+        );
         let env = HearingsEnv {
             backend: Arc::new(FakeBackend::new("")),
+            review: Arc::new(review),
             model_dirs: ModelDirs {
                 hf_cache: dir.join("hub"),
                 handy: dir.join("handy"),
@@ -2525,8 +2555,16 @@ mod tests {
         write_fake_model(&dirs.handy.join(NEMOTRON.file), &NEMOTRON);
         write_fake_model(&dirs.handy.join(SILERO_VAD.file), &SILERO_VAD);
         let backend = FakeBackend::new("");
+        let review = FakeReviewBackend::new(
+            FakeLlm::new("[]", "{}"),
+            FakeNli {
+                word: String::new(),
+                contradiction: 0.0,
+            },
+        );
         let env = HearingsEnv {
             backend: Arc::new(backend.clone()),
+            review: Arc::new(review),
             model_dirs: dirs,
             data_dir: dir.join("data"),
         };
@@ -2666,5 +2704,85 @@ mod tests {
             window.try_find("hearings").is_none() && window.try_find("empty-state").is_some()
         })
         .await;
+    }
+
+    #[gpui_kit::test]
+    async fn the_source_of_a_suggestion_opens_the_evidence_at_its_page(cx: &mut TestAppContext) {
+        let path = temp_dir("source").join("acta.txt");
+        fs::write(&path, "x").unwrap();
+        let (store, case) = store_with_case();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let page = |number: u32, text: &str| Page {
+            number,
+            text: text.into(),
+            source: PageSource::Text,
+        };
+        store
+            .save_analysis(
+                evidence,
+                &[
+                    page(1, "Primera página."),
+                    page(2, "La declaración del acusado fue rendida en Bogotá."),
+                ],
+            )
+            .unwrap();
+        let chunk = store.search(case, "declaracion", 1).unwrap()[0].chunk_id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store.insert_segment(hearing, 0, Speaker::Accused).unwrap();
+        store
+            .finish_segment(segment, "Declaré en Medellín.", 2_000)
+            .unwrap();
+        let suggestion = store
+            .insert_suggestion(&NewSuggestion {
+                hearing_id: hearing,
+                segment_id: segment,
+                chunk_id: chunk,
+                claim: "El acusado declaró en Medellín.".into(),
+                claim_quote: None,
+                evidence_quote: "fue rendida en Bogotá".into(),
+                kind: None,
+                level: SuggestionLevel::Check,
+                nli_contradiction: 0.7,
+                explanation: None,
+            })
+            .unwrap()
+            .id as u64;
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click(("hearing", hearing as u64), cx)
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("source", suggestion)).is_some()
+        })
+        .await;
+
+        cx.update_window(window, |_, window, cx| {
+            window.click(("source", suggestion), cx)
+        })
+        .unwrap();
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("page", 2u64)).is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.screen, Screen::Evidence);
+            assert_eq!(view.selected, Some(evidence));
+            assert_eq!(view.tab, Tab::Text);
+        });
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find(("page", 2u64)).visible());
+        })
+        .unwrap();
     }
 }

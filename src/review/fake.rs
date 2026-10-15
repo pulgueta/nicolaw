@@ -79,12 +79,15 @@ impl Nli for FakeNli {
     }
 }
 
+/// The NLI files and the language model files of one load.
+type LoadedFiles = (Vec<PathBuf>, Vec<PathBuf>);
+
 /// Loads the fake models. It records the files of the last load.
 #[derive(Clone)]
 pub struct FakeReviewBackend {
     pub llm: FakeLlm,
     pub nli: FakeNli,
-    pub loaded: Arc<Mutex<Option<(Vec<PathBuf>, Vec<PathBuf>)>>>,
+    pub loaded: Arc<Mutex<Option<LoadedFiles>>>,
 }
 
 impl FakeReviewBackend {

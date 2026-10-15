@@ -225,6 +225,11 @@ impl JobQueue {
         }
     }
 
+    /// True if `other` is a clone of this queue.
+    pub fn same(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
     pub fn pending(&self) -> usize {
         self.receiver.len()
     }

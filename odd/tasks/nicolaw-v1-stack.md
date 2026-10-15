@@ -21,7 +21,7 @@ The user wants a desktop tool that flags statements in a hearing that conflict w
 - OCR is in layer 1 (Apple Vision through `objc2-vision`; PDF text and page rendering through `objc2-pdf-kit`). macOS Apple Silicon is the target; 16 GB RAM minimum.
 - UI copy in Spanish (ASD-STE100 style: short sentences, active voice). Code, comments, docs, commits in English.
 - Speaker role is assigned manually in v1 (toggle "the accused is speaking"). No automatic diarization.
-- The LLM runs embedded (`llama-cpp-2`, Metal). No Ollama server.
+- The LLM runs embedded (`llama-cpp-2`, Metal). No Ollama server. (Changed in T4: candle, see the T4 decisions.)
 - STT reuses Handy's GGUF models through `transcribe-cpp` 0.4 (Metal). Primary: Nemotron Streaming 3.5 0.6B. Refine pass: Cohere Transcribe. Models download on demand, never during a hearing.
 - Jev is API-only and cannot run locally. Contradiction scoring uses mDeBERTa-v3 multilingual NLI (candle, Metal). Suggestions are quiet, reviewable, and always carry the exact source passage. No credibility scores.
 - The GitHub repository `pulgueta/nicolaw` (private) is created after layer 1 is ready. The first commit on `main` is a scaffold only, not the old working tree.
@@ -46,7 +46,7 @@ chunks(id, evidence_id, page, idx, text) + chunks_fts (FTS5, unicode61 remove_di
 hearings(id, case_id, title, started_at, ended_at, audio_path)
 segments(id, hearing_id, t_start_ms, t_end_ms, text, speaker 'accused'|'other', final INTEGER)
 -- layer 3
-suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, kind, nli_contra, explanation, status 'open'|'confirmed'|'dismissed', created_at)
+suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, claim_quote, kind, level 'conflict'|'check', nli_contradiction REAL, explanation, status 'open'|'confirmed'|'dismissed', created_at)
 ```
 
 ## Delivery
@@ -61,7 +61,7 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, kind, n
 - [x] T1 Layer 1 `foundation`: cases, evidence hashing, extraction (PDF text, OCR, images, txt/md, docx), chunking, FTS5 search, Spanish UI with analysis status and search. Route: delegated writer (opus). Commit on `foundation`.
 - [x] T2 Create private GitHub repo, push `main`, `gh stack submit --auto`. Route: inline.
 - [x] T3 Layer 2 `transcription`: hearings, audio capture, VAD, streaming STT with Handy model discovery and download, live transcript, speaker toggle, WAV per hearing. Route: delegated writer (opus).
-- [ ] T4 Layer 3 `analysis`: claim extraction, case-scoped retrieval, NLI scoring, LLM explanation, suggestion queue UI. Route: delegated writer (opus).
+- [x] T4 Layer 3 `analysis`: claim extraction, case-scoped retrieval, NLI scoring, LLM explanation, suggestion queue UI. Route: delegated writer (opus).
 - [ ] T5 Final: `gh stack submit --auto`, `gh stack view --json` check, `cargo clean`, session summary.
 
 ## Progress and evidence
@@ -181,6 +181,48 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, kind, n
 - T3 real-model checks (`#[ignore]`, `cargo test -- --ignored --nocapture real_`): Cohere Transcribe Q5_K_M from Handy's cache, Metal. Paulina (es_MX): "Buenos días. La audiencia empieza a las nueve de la mañana. El acusado dice que no estaba en Bogotá el 12 de marzo." (exact). Monica (es_ES), same text: "Buenos días, la audiencia en Pisa a las nueve de la mañana, ..." ("empieza" misheard); Monica, short sentence only: "La Odincha en Pisa a las nueve de la mañana." Silero VAD downloaded into a temporary cache (157 progress calls, last 1241056/1241056), 222 speech frames in the Paulina WAV, 0 in 30 silent frames.
 - T3 not observed: a real microphone and the macOS permission prompt; Nemotron Streaming (not installed, so the streaming and partial-text path of `NativeTranscriber` ran with the fake only); the download of Nemotron; the refine pass with real models; the quit hook; the Audiencias screen in a visible window (headless tests only).
 
+- T4: commits on `analysis`: `93147c9` feat(store): add suggestions, `3ae65cc` feat(models): add NLI and LLM catalog entries, `daf0bb0` feat(review): add claim extraction, NLI scoring, and explanation worker, `28a4fb0` feat(app): add suggestions panel, `b44245b` test(review): add real pipeline check. This document is in the next commit (`docs(odd): record layer 3 evidence`).
+- T4 authored lines (`git diff --stat transcription..analysis`, before this document): 15 files, 4903 insertions, 64 deletions. Without `Cargo.lock`: 14 files, 4022 insertions, 51 deletions. Largest: `src/hearings.rs` +1068 (about 420 of it view tests), `src/store.rs` +676 (about 330 tests), `src/review/analyzer.rs` 601 (about 330 tests), `src/review/native.rs` 520 (about 230 ignored real-model tests).
+- T4 modules: `src/review/mod.rs` (traits `Llm`, `Nli`, `ReviewBackend`; `ReviewEvent`; thresholds and `decide`), `query.rs` (search terms of a claim), `parse.rs` (claims JSON, explanation JSON with exact-substring checks, premise windows), `prompt.rs` (Qwen3 chat prompts, untrusted data in tagged blocks, JSON end), `analyzer.rs` (`Analyzer`, `JobQueue`, `run`), `native.rs` (candle engines, one thread per model), `fake.rs` (test fakes). `src/analysis.rs` (evidence extraction queue) is unchanged.
+- T4 decisions that differ from the brief, or add to it:
+  - **LLM runtime: candle, not `llama-cpp-2`.** Observed with `llama-cpp-2` 0.1.159 (`metal`, `dynamic-link`): the binary links `@rpath/libllama.0.dylib` and `libggml*.0.dylib` but has no `LC_RPATH`, so it does not start (`dyld: Library not loaded: @rpath/libggml-base.0.dylib`). The fix needs a build script (outside the authorized edit surfaces). Also, transcribe-cpp links a static ggml 0.26 into the same binary (llama.cpp 0.1.159 has ggml 0.24); `nm -m` showed the Rust-side ggml symbols bound to the static 0.26 copy, an ABI risk. A static llama build would put two ggml versions in one link unit. candle runs both models with no second ggml and no dylibs. To return to llama.cpp later: add `build.rs` with `cargo:rustc-link-arg=-Wl,-rpath,...` and ship the dylibs in the app bundle, and keep the Rust code away from direct `ggml_*` calls.
+  - **LLM model: `Qwen/Qwen3-4B-GGUF`, file `Qwen3-4B-Q4_K_M.gguf` (2497 MB), revision `bc640142c66e1fdd12af0bd68f40445458f3869b`, tokenizer from `Qwen/Qwen3-4B` revision `1cfa9a7208912126459214e8b04321603b3df60c` (the GGUF tokenizer is not readable by `tokenizers`).** Official Qwen GGUF, Apache 2.0. candle 0.11 has `quantized_qwen3` but no loader for Gemma 4 E4B or Qwen3.5 (new architectures). An official `Qwen/Qwen3-4B-Instruct-2507-GGUF` repo does not exist (HF API: not found). Thinking is off: the prompt ends with an empty `<think></think>` block, as the Qwen3 template does for `enable_thinking=False`.
+  - **No grammar-constrained decoding** (candle has none). Instead: the answer starts with `[` or `{` in the prompt, generation stops when the first JSON value is complete (`json_end`), temperature 0.1 with a fixed seed, and `parse.rs` validates the output (claims: array of strings, at most 5; explanation: all keys, known kind, exact substrings). Invalid output gives no claims, or a `check` with the note "Nicolaw no puede verificar la explicación. Lea el pasaje de la prueba."
+  - **NLI on Metal works** (no CPU fallback): `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` revision `b5113eb38ab63efdd7f280f8c144ea8b13f978ce` (config, tokenizer.json, model.safetensors). The safetensors file is float16 on disk; Nicolaw loads it as float32. Tokenizer truncation at 512 tokens.
+  - candle and tokenizers get `opt-level = 3` in the dev profile (like the gpui crates). Before: two NLI pairs took 8.5 s in the debug build; after: 121 ms, and 38 ms for one warm pair.
+  - Retrieval adds `Store::search_any` (OR of the terms, BM25 order). The existing `Store::search` joins terms with AND, which rarely matches all words of a claim. Both share `fts_query`, so all input stays FTS-safe.
+  - Thresholds (`src/review/mod.rs`, initial values to tune on real data): conflict when P(contradiction) >= 0.85 and P(contradiction) - P(entailment) >= 0.5; check when P(contradiction) >= 0.60. Both directions are scored; each label keeps its maximum. A pair at >= 0.85 that fails the margin is a check.
+  - At most 2 suggestions per claim (strongest first, one per chunk), so that the queue stays quiet and the LLM explains few pairs. Long chunks split into premises of at most 150 words on sentence boundaries; each premise is an exact substring of the chunk.
+  - A conflict needs NLI level `conflict` and the LLM `contradiction: true`. All other flagged pairs are `check`.
+  - Jobs carry a hash of the segment text. The analyzer reads the segment from the store and skips it when the speaker is not `accused`, the text changed (refine pass), or the segment is gone; it checks again before each insert. The view enqueues accused finals and every refined text (the analyzer filters the speaker). The question context is `Store::question_before` (the last final `other` segment before the answer).
+  - Queue: `JobQueue` (bounded, 32). When full, the new job replaces the oldest and a counter grows. `ReviewEvent::Progress` has `pending` and `dropped` (the brief had `pending` only); the panel shows the dropped count.
+  - Models: `Role` gained `Nli` and `Llm` (the brief's "kinds"). Analysis models are `AnalysisModel` entries with several `RepoFile`s at pinned revisions; installed only when all files are in the cache snapshot. `download_files` skips files that are already there (hf-hub 0.4 `download_with_progress` always downloads).
+  - The analysis models load when a recording starts with "Analizar en vivo" on (the queue keeps segments while they load), and stay loaded until the switch goes off or the app quits. Each model has its own thread (`ModelThread`), joined on drop. ggml is not involved, so the layer 2 abort at exit does not apply; at quit, the queue closes and the review task is dropped.
+  - Deleting evidence deletes the suggestions of its chunks (a suggestion without its source passage has no meaning). Deleting a hearing deletes its suggestions.
+  - Filter default: "Abiertas" during the live recording of the hearing, "Todas" for other hearings and after Finalizar.
+  - The source link emits `OpenEvidence { evidence_id, page }`; the app switches to Pruebas and reuses the hit -> page navigation (`open_page`).
+  - Test harness note: in the live view test, the speaker switch is set through state, because a click on the Start button right after a click on a Switch did not reach the button.
+- T4 TDD evidence (runner `cargo test`):
+  - store RED: 26 compile errors (`unresolved imports super::NewSuggestion, ...`, `no method named insert_suggestion`, `suggestions`, `chunk`, `segment`, `question_before`, `search_any`, ...). GREEN: 37 passed. Then a v3 -> v4 migration test (passed at once: regression guard, no RED).
+  - models RED: `unresolved imports super::ANALYSIS_MODELS, super::LLM, super::NLI, super::find_files`, `no variant Role::Nli / Role::Llm`. GREEN: 12 passed.
+  - query RED: `unresolved import super::query_terms`. GREEN: 3 passed.
+  - decide and parse RED: `unresolved imports super::NliScores, super::decide` and `super::Explanation, super::MAX_CLAIMS, ...`. GREEN: 23 review tests passed.
+  - analyzer and queue RED: 4 compile errors (`super::Analyzer, super::Job, super::JobQueue, super::text_hash`, `super::Engines, super::Llm, ...`, `UNVERIFIED_NOTE`). GREEN: 33 review tests passed.
+  - prompt RED: `unresolved imports super::claims_prompt, super::explain_prompt, super::json_end`. First run: 3 passed, 1 failed (test error: the system prompt names `<pregunta>`; the test now checks the block `<pregunta>\n`). GREEN: 37 review tests passed.
+  - view RED: 13 compile errors (`unresolved import super::Filter`, `HearingsEnv has no field review`, `no method apply_review`, `no field counts`, ...). First runs: 6 failed. Causes: the panel id had no `.test_support()`; the filter `Select` grew to 470 px in the column, so the card buttons were outside the window (fixed with a `flex_none` wrapper); a rediscovery loop (`start_review` -> `ModelsMissing` -> discovery -> `start_review`) hung the suite while a recording ran without analysis models (fixed: `start_review` returns quietly when files are missing; `ModelsMissing` comes only when the files are gone at load time). GREEN: 149 passed, 0 failed, 7 ignored.
+- T4 checks (final tree `b44245b`): `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0 (only the dependency note about `block v0.1.6`); `cargo test` 149 passed, 0 failed, 7 ignored; `cargo build` exit 0; start check `HOME=/tmp/nicolaw-home ./target/debug/nicolaw` alive after 8 s, stderr 0 bytes, database `user_version` 4 with `suggestions`.
+- T4 real-model checks (`#[ignore]`, models downloaded into `~/.cache/huggingface/hub` with `real_analysis_models_download`, which uses `models::download_files`):
+  - `real_nli`: device Metal. "El 12 de marzo el acusado viajó a Medellín y no estuvo en Bogotá." vs "El acusado estaba en Bogotá el 12 de marzo.": evidence -> claim entailment 0.0018, neutral 0.0019, contradiction 0.9963; claim -> evidence entailment 0.0025, neutral 0.0040, contradiction 0.9935. Unrelated pair: contradiction 0.0004, neutral 0.9973. Load 1.7 s.
+  - `real_llm` (Metal): question "¿Dónde estaba usted el 12 de marzo?", statement "Ese día yo estaba en Bogotá, en la casa de mi hermana, y le pagué dos millones de pesos." -> `[ "El acusado estaba en Bogotá el 12 de marzo.", "El acusado estaba en la casa de su hermana el 12 de marzo.", "El acusado le pagó dos millones de pesos el 12 de marzo." ]` in 5.6 s. Explanation for the first claim against a hotel passage: valid JSON, `contradiction: true`, kind `location`, quotes pass the exact-substring check, 8.8 s.
+  - `real_pipeline` (full analyzer, both models): one answer -> 1 `conflict` (location, P=0.875, "registro-hotel.txt", página 1) and 2 `check` (P=0.805 and 0.722, página 2), in 66 s.
+  - `real_backend`: both models load through `NativeReview` and the threads stop on drop.
+- T4 not observed: the panel in a visible window (headless tests only); a real hearing with live analysis; the Descargar buttons of the panel against the network (the download code path ran through the ignored test); analysis speed in a release build.
+- T4 open issues:
+  - Speed: about 66 s for one answer with 2 claims and 3 explanations (debug build, Metal). In a long hearing the queue can drop old answers (counted and shown). Options: fewer explanations, a smaller LLM for claims, or a release build check.
+  - The LLM often quotes the full claim as `quote_claim` (valid, but not precise). Prompt tuning on real data.
+  - A speaker correction after the fact (toggle to Acusado) does not enqueue the segment.
+  - The thresholds are initial values.
+
 ## UI copy (layer 2)
 
 | Location | Text |
@@ -228,6 +270,36 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, kind, n
 | Delete error | Nicolaw no puede eliminar la audiencia. Intente de nuevo. |
 | Speaker change error | Nicolaw no puede cambiar el hablante. Intente de nuevo. |
 
+## UI copy (layer 3)
+
+| Location | Text |
+| --- | --- |
+| Panel title | Sugerencias |
+| Counters (tags) | Conflictos: <n>, Revisar: <n> |
+| Live analysis switch | Analizar en vivo |
+| Missing models | Faltan los modelos de análisis. Nicolaw graba y transcribe la audiencia sin ellos. |
+| Model row | <model name> · <n> MB, with button Descargar |
+| Download progress accessible name | Descarga |
+| Models loading | Nicolaw carga los modelos de análisis. |
+| Queue | Declaraciones en análisis: <n> |
+| Dropped jobs | Nicolaw no analizó <n> declaraciones. Había demasiadas en espera. |
+| Filter accessible name | Filtro de sugerencias |
+| Filter options | Abiertas, Confirmadas, Descartadas, Todas |
+| Empty panel | No hay sugerencias. Nicolaw analiza las declaraciones del acusado cuando terminan. |
+| Empty filter | No hay sugerencias con este filtro. |
+| Card level tags | Posible conflicto, Revisar |
+| Card kinds | Fecha, Cantidad, Identidad, Lugar, Secuencia, Otro |
+| Card labels | Declaración, Prueba |
+| Card evidence quote | «<quote>» |
+| Card source | <file name> · Página <n> (file name opens the evidence in Pruebas at the page) |
+| Card buttons | Confirmar, Descartar |
+| Card status tags | Confirmada, Descartada |
+| Unverified explanation | Nicolaw no puede verificar la explicación. Lea el pasaje de la prueba. |
+| Decision error | Nicolaw no puede guardar la decisión. Intente de nuevo. |
+| Model load error | Nicolaw no puede cargar los modelos de análisis. Descargue los modelos de nuevo. |
+| Analysis error | Nicolaw no puede analizar una declaración del acusado. |
+| Storage error | Nicolaw no puede guardar las sugerencias. |
+
 ## Next step
 
-T3 manual check in a visible window: the microphone permission prompt, a real hearing with Nemotron Streaming (select Descargar first), partial text, Pausar / Reanudar / Finalizar, and the refine pass with Cohere. Then T4 (layer 3 `analysis`).
+T4 manual check in a visible window: download the analysis models with Descargar in the Sugerencias panel, record a hearing with the speaker switch on, and check the cards, the source link, Confirmar / Descartar, and the filter. Then T5 (`gh stack submit --auto`, `gh stack view --json`, `cargo clean`, session summary). The T3 manual check is still open.

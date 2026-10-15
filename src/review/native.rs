@@ -406,6 +406,96 @@ mod tests {
         );
     }
 
+    /// Runs the full analysis with the real models: a hearing answer of the accused against a
+    /// hotel register in the case.
+    ///
+    /// ```sh
+    /// cargo test -- --ignored --nocapture real_pipeline
+    /// ```
+    #[test]
+    #[ignore = "needs the installed analysis models"]
+    fn real_pipeline_finds_a_conflict_with_its_source() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::extract::{Page, PageSource};
+        use crate::review::ReviewEvent;
+        use crate::review::analyzer::{Analyzer, Job, text_hash};
+        use crate::store::{Speaker, Store};
+
+        let store = Store::open_in_memory().unwrap();
+        let case = store.create_case("Caso").unwrap().id;
+        let dir = std::env::temp_dir().join(format!("nicolaw-real-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registro-hotel.txt");
+        std::fs::write(&path, "x").unwrap();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let pages = [
+            "Registro de huéspedes del Hotel Andino, Medellín.",
+            "El señor Carlos Pérez se registró el 12 de marzo de 2024 a las 8:00 p. m. en la \
+             habitación 204 y salió el 14 de marzo. Pagó 450.000 pesos en efectivo.",
+        ];
+        let pages: Vec<Page> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Page {
+                number: i as u32 + 1,
+                text: (*text).into(),
+                source: PageSource::Text,
+            })
+            .collect();
+        store.save_analysis(evidence, &pages).unwrap();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let question = store.insert_segment(hearing, 0, Speaker::Other).unwrap();
+        store
+            .finish_segment(
+                question,
+                "¿Dónde estuvo usted entre el 12 y el 14 de marzo?",
+                3_000,
+            )
+            .unwrap();
+        let answer_text = "Esos días yo estuve en Bogotá, en mi casa. Nunca fui a Medellín.";
+        let answer = store
+            .insert_segment(hearing, 4_000, Speaker::Accused)
+            .unwrap();
+        store.finish_segment(answer, answer_text, 8_000).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let engines = NativeReview.load(&files(&NLI), &files(&LLM)).unwrap();
+        let mut analyzer = Analyzer::new(store.clone(), engines);
+
+        let started = std::time::Instant::now();
+        let events = analyzer.analyze(&Job {
+            case_id: case,
+            hearing_id: hearing,
+            segment_id: answer,
+            text_hash: text_hash(answer_text),
+        });
+
+        println!("analysis: {:?}", started.elapsed());
+        for event in &events {
+            match event {
+                ReviewEvent::SuggestionAdded(s) => println!(
+                    "{:?} {:?} p(contradiction)={:.3}\n  claim: {}\n  claim quote: {:?}\n  \
+                     evidence: {} (página {}): {}\n  explanation: {:?}",
+                    s.level,
+                    s.kind,
+                    s.nli_contradiction,
+                    s.claim,
+                    s.claim_quote,
+                    s.evidence_name,
+                    s.page,
+                    s.evidence_quote,
+                    s.explanation
+                ),
+                other => println!("{other:?}"),
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ReviewEvent::SuggestionAdded(_)))
+        );
+    }
+
     /// Loads both models through the backend, as the app does.
     ///
     /// ```sh

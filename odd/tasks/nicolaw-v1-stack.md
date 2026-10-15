@@ -62,7 +62,7 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, claim_q
 - [x] T2 Create private GitHub repo, push `main`, `gh stack submit --auto`. Route: inline.
 - [x] T3 Layer 2 `transcription`: hearings, audio capture, VAD, streaming STT with Handy model discovery and download, live transcript, speaker toggle, WAV per hearing. Route: delegated writer (opus).
 - [x] T4 Layer 3 `analysis`: claim extraction, case-scoped retrieval, NLI scoring, LLM explanation, suggestion queue UI. Route: delegated writer (opus).
-- [ ] T5 Final: `gh stack submit --auto`, `gh stack view --json` check, `cargo clean`, session summary.
+- [x] T5 Final: `gh stack submit --auto`, `gh stack view --json` check, `cargo clean`, session summary.
 
 ## Progress and evidence
 
@@ -300,6 +300,8 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, claim_q
 | Analysis error | Nicolaw no puede analizar una declaración del acusado. |
 | Storage error | Nicolaw no puede guardar las sugerencias. |
 
+- T5: `gh stack submit --auto` created PR #4 for `analysis` (PR number 3 was not assigned by GitHub). `gh stack view --json`: trunk `main`, branches foundation (#1 OPEN), transcription (#2 OPEN), analysis (#4 OPEN), none needs rebase. PR titles and bodies set with `gh pr edit`. Parent spot checks: layer 1 `cargo test` 58 passed; layer 2 `cargo test` 99 passed, 2 ignored; layer 3 `cargo fmt --check` exit 0 and full `cargo test` rerun followed by `cargo clean` (result recorded in the session summary).
+
 ## Next step
 
-T4 manual check in a visible window: download the analysis models with Descargar in the Sugerencias panel, record a hearing with the speaker switch on, and check the cards, the source link, Confirmar / Descartar, and the filter. Then T5 (`gh stack submit --auto`, `gh stack view --json`, `cargo clean`, session summary). The T3 manual check is still open.
+T4 manual check in a visible window: download the analysis models with Descargar in the Sugerencias panel, record a hearing with the speaker switch on, and check the cards, the source link, Confirmar / Descartar, and the filter. The T3 manual check (real microphone, Nemotron download and streaming) is still open. The stack is submitted as drafts; marking PRs ready and merging are the user's decisions.

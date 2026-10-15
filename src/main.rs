@@ -1,6 +1,7 @@
 mod analysis;
 mod app;
 mod extract;
+mod models;
 mod preview;
 mod store;
 mod transfer;

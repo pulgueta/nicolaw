@@ -11,14 +11,18 @@ use crate::extract::{Page, PageSource};
 /// The largest file that the store accepts: 100 MB.
 pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
+/// The analysis search takes at most this number of passages from one evidence file before it
+/// fills the rest of its limit by rank.
+pub const PASSAGES_PER_EVIDENCE: usize = 2;
+
 /// The store moves file content in blocks of this size, and reports progress after each block.
 pub const BLOCK_SIZE: usize = 256 * 1024;
 
 /// Version 1 had one `files` table. Version 2 has cases, evidence, pages, chunks, and search.
-/// Version 3 adds hearings and their transcript segments. No release has version 3 yet, so its
-/// segment columns can still grow: [`Store::migrate`] adds the new columns to a version 3
-/// database that a development build made.
-const SCHEMA_VERSION: i64 = 3;
+/// Version 3 adds hearings and their transcript segments. Version 4 adds the suggestions of
+/// the analysis. No release has version 3 yet, so its segment columns can still grow:
+/// [`Store::migrate`] adds the new columns to a database that a development build made.
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V2: &str = "
     DROP TABLE IF EXISTS files;
@@ -101,6 +105,28 @@ const SCHEMA_V3: &str = "
         failed     INTEGER NOT NULL DEFAULT 0  -- 1: the speech in this time range has no text
     );
     CREATE INDEX segments_hearing ON segments(hearing_id);
+";
+
+const SCHEMA_V4: &str = "
+    CREATE TABLE suggestions (
+        id                INTEGER PRIMARY KEY,
+        hearing_id        INTEGER NOT NULL REFERENCES hearings(id),
+        segment_id        INTEGER NOT NULL REFERENCES segments(id),
+        chunk_id          INTEGER NOT NULL REFERENCES chunks(id),
+        claim             TEXT    NOT NULL,
+        evidence_quote    TEXT    NOT NULL,
+        claim_quote       TEXT,
+        kind              TEXT
+            CHECK (kind IN ('date', 'amount', 'identity', 'location', 'sequence', 'other')),
+        level             TEXT    NOT NULL CHECK (level IN ('conflict', 'check')),
+        nli_contradiction REAL    NOT NULL,
+        explanation       TEXT,
+        status            TEXT    NOT NULL DEFAULT 'open'
+            CHECK (status IN ('open', 'confirmed', 'dismissed')),
+        created_at        INTEGER NOT NULL -- Unix seconds
+    );
+    CREATE INDEX suggestions_hearing ON suggestions(hearing_id);
+    CREATE INDEX suggestions_chunk ON suggestions(chunk_id);
 ";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +215,150 @@ pub struct Segment {
     pub failed: bool,
 }
 
+/// How sure the analysis is that a statement conflicts with the evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionLevel {
+    /// The NLI model and the language model agree that the passage contradicts the statement.
+    Conflict,
+    /// The passage can contradict the statement. A person must read it.
+    Check,
+}
+
+impl SuggestionLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::Check => "check",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "conflict" => Self::Conflict,
+            _ => Self::Check,
+        }
+    }
+}
+
+/// What the statement and the evidence do not agree on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Date,
+    Amount,
+    Identity,
+    Location,
+    Sequence,
+    Other,
+}
+
+impl SuggestionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Date => "date",
+            Self::Amount => "amount",
+            Self::Identity => "identity",
+            Self::Location => "location",
+            Self::Sequence => "sequence",
+            Self::Other => "other",
+        }
+    }
+
+    /// Returns `None` for a value that is not a kind.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "date" => Self::Date,
+            "amount" => Self::Amount,
+            "identity" => Self::Identity,
+            "location" => Self::Location,
+            "sequence" => Self::Sequence,
+            "other" => Self::Other,
+            _ => return None,
+        })
+    }
+}
+
+/// The decision of the lawyer about a suggestion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionStatus {
+    Open,
+    Confirmed,
+    Dismissed,
+}
+
+impl SuggestionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Confirmed => "confirmed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "confirmed" => Self::Confirmed,
+            "dismissed" => Self::Dismissed,
+            _ => Self::Open,
+        }
+    }
+}
+
+/// A suggestion before it is stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewSuggestion {
+    pub hearing_id: i64,
+    pub segment_id: i64,
+    pub chunk_id: i64,
+    /// One statement of the accused, as a standalone sentence.
+    pub claim: String,
+    /// The part of the claim that conflicts, if the language model found it.
+    pub claim_quote: Option<String>,
+    /// The exact passage of the evidence.
+    pub evidence_quote: String,
+    pub kind: Option<SuggestionKind>,
+    pub level: SuggestionLevel,
+    /// The probability of contradiction from the NLI model, from 0 to 1.
+    pub nli_contradiction: f64,
+    pub explanation: Option<String>,
+}
+
+/// A stored suggestion, with the source of its evidence passage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suggestion {
+    pub id: i64,
+    pub hearing_id: i64,
+    pub segment_id: i64,
+    pub chunk_id: i64,
+    pub evidence_id: i64,
+    pub evidence_name: String,
+    pub page: u32,
+    pub claim: String,
+    pub claim_quote: Option<String>,
+    pub evidence_quote: String,
+    pub kind: Option<SuggestionKind>,
+    pub level: SuggestionLevel,
+    pub nli_contradiction: f64,
+    pub explanation: Option<String>,
+    pub status: SuggestionStatus,
+}
+
+/// The open suggestions of a hearing, by level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SuggestionCounts {
+    pub conflict: u32,
+    pub check: u32,
+}
+
+/// One chunk of evidence text, with its file and page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkSource {
+    pub id: i64,
+    pub evidence_id: i64,
+    pub evidence_name: String,
+    pub page: u32,
+    pub text: String,
+}
+
 /// One evidence file, without its content.
 #[derive(Clone, Debug)]
 pub struct Evidence {
@@ -222,7 +392,7 @@ pub struct SearchHit {
     pub chunk_id: i64,
     pub snippet: String,
     /// BM25 rank. A lower value is a better match.
-    // The list shows hits in rank order. The rank value is for the retrieval in layer 3.
+    // The list and the analysis use the hits in rank order. The value is for diagnostics.
     #[allow(dead_code)]
     pub rank: f64,
 }
@@ -264,6 +434,14 @@ const SELECT_EVIDENCE: &str = "SELECT e.id, e.name, e.mime, e.size, e.sha256, \
      (SELECT count(*) FROM evidence_pages p WHERE p.evidence_id = e.id) \
      FROM evidence e";
 
+const SELECT_SUGGESTION: &str = "SELECT s.id, s.hearing_id, s.segment_id, s.chunk_id, \
+     c.evidence_id, e.name, c.page, s.claim, s.claim_quote, s.evidence_quote, s.kind, s.level, \
+     s.nli_contradiction, s.explanation, s.status \
+     FROM suggestions s JOIN chunks c ON c.id = s.chunk_id JOIN evidence e ON e.id = c.evidence_id";
+
+const SELECT_SEGMENT: &str =
+    "SELECT id, t_start_ms, t_end_ms, text, speaker, final, revision, failed FROM segments";
+
 const SELECT_HEARING: &str = "SELECT id, title, \
      strftime('%Y-%m-%d %H:%M', started_at, 'unixepoch', 'localtime'), \
      strftime('%Y-%m-%d %H:%M', ended_at, 'unixepoch', 'localtime'), \
@@ -294,7 +472,10 @@ impl Store {
                 // No data of version 1 is in use, so the migration drops the `files` table.
                 tx.execute_batch(SCHEMA_V2)?;
             }
-            tx.execute_batch(SCHEMA_V3)?;
+            if version < 3 {
+                tx.execute_batch(SCHEMA_V3)?;
+            }
+            tx.execute_batch(SCHEMA_V4)?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
         }
@@ -536,7 +717,8 @@ impl Store {
         query: &str,
         hits_per_group: usize,
     ) -> rusqlite::Result<Vec<SearchGroup>> {
-        let Some(query) = fts_query(query) else {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let Some(query) = fts_query(&words, " ") else {
             return Ok(Vec::new());
         };
         let mut groups: Vec<SearchGroup> = Vec::new();
@@ -595,30 +777,75 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<SearchHit>> {
-        let Some(query) = fts_query(query) else {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        self.run_search(case_id, fts_query(&words, " "), limit, limit)
+    }
+
+    /// Full-text search for chunks that have at least one of the words, best match first. The
+    /// BM25 rank puts chunks with more of the words, and with rare words, first. Each word is a
+    /// prefix term, and a word with spaces or punctuation (for example a date) is a phrase.
+    /// The first hits take at most [`PASSAGES_PER_EVIDENCE`] chunks from one file; the rest of
+    /// the limit fills by rank. Thus one file with many hits cannot fill all the candidates.
+    pub fn search_any(
+        &self,
+        case_id: i64,
+        words: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<SearchHit>> {
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        self.run_search(
+            case_id,
+            fts_query(&words, " OR "),
+            limit,
+            PASSAGES_PER_EVIDENCE,
+        )
+    }
+
+    /// The best `limit` hits. The hits with a rank of at most `per_evidence` in their file come
+    /// first, by rank; the other hits fill the rest of the limit, by rank.
+    fn run_search(
+        &self,
+        case_id: i64,
+        query: Option<String>,
+        limit: usize,
+        per_evidence: usize,
+    ) -> rusqlite::Result<Vec<SearchHit>> {
+        let Some(query) = query else {
             return Ok(Vec::new());
         };
         self.conn
             .prepare(
-                "SELECT e.id, e.name, c.page, c.id,
-                        snippet(chunks_fts, 0, '', '', '…', 16), bm25(chunks_fts)
-                 FROM chunks_fts
-                 JOIN chunks c ON c.id = chunks_fts.rowid
-                 JOIN evidence e ON e.id = c.evidence_id
-                 WHERE chunks_fts MATCH ?1 AND e.case_id = ?2
-                 ORDER BY bm25(chunks_fts)
+                "WITH hits AS (
+                     SELECT e.id AS evidence_id, e.name AS name, c.page AS page,
+                            c.id AS chunk_id, snippet(chunks_fts, 0, '', '', '…', 16) AS snippet,
+                            bm25(chunks_fts) AS rank
+                     FROM chunks_fts
+                     JOIN chunks c ON c.id = chunks_fts.rowid
+                     JOIN evidence e ON e.id = c.evidence_id
+                     WHERE chunks_fts MATCH ?1 AND e.case_id = ?2
+                 ), numbered AS (
+                     SELECT *,
+                            row_number() OVER (PARTITION BY evidence_id ORDER BY rank, chunk_id)
+                                AS n
+                     FROM hits
+                 )
+                 SELECT evidence_id, name, page, chunk_id, snippet, rank FROM numbered
+                 ORDER BY n > ?4, rank, chunk_id
                  LIMIT ?3",
             )?
-            .query_map(params![query, case_id, limit as i64], |row| {
-                Ok(SearchHit {
-                    evidence_id: row.get(0)?,
-                    evidence_name: row.get(1)?,
-                    page: row.get(2)?,
-                    chunk_id: row.get(3)?,
-                    snippet: row.get(4)?,
-                    rank: row.get(5)?,
-                })
-            })?
+            .query_map(
+                params![query, case_id, limit as i64, per_evidence as i64],
+                |row| {
+                    Ok(SearchHit {
+                        evidence_id: row.get(0)?,
+                        evidence_name: row.get(1)?,
+                        page: row.get(2)?,
+                        chunk_id: row.get(3)?,
+                        snippet: row.get(4)?,
+                        rank: row.get(5)?,
+                    })
+                },
+            )?
             .collect()
     }
 
@@ -694,10 +921,11 @@ impl Store {
         )
     }
 
-    /// Deletes the hearing with its segments, then its audio file.
+    /// Deletes the hearing with its segments and suggestions, then its audio file.
     pub fn delete_hearing(&self, id: i64) -> rusqlite::Result<()> {
         let audio_path = self.hearing(id)?.audio_path;
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM suggestions WHERE hearing_id = ?1", [id])?;
         tx.execute("DELETE FROM segments WHERE hearing_id = ?1", [id])?;
         tx.execute("DELETE FROM hearings WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -780,23 +1008,116 @@ impl Store {
     /// Returns the segments of a hearing in time order.
     pub fn segments(&self, hearing_id: i64) -> rusqlite::Result<Vec<Segment>> {
         self.conn
-            .prepare(
-                "SELECT id, t_start_ms, t_end_ms, text, speaker, final, revision, failed
-                 FROM segments WHERE hearing_id = ?1 ORDER BY t_start_ms, id",
-            )?
-            .query_map([hearing_id], |row| {
-                Ok(Segment {
-                    id: row.get(0)?,
-                    t_start_ms: row.get(1)?,
-                    t_end_ms: row.get(2)?,
-                    text: row.get(3)?,
-                    speaker: Speaker::parse(&row.get::<_, String>(4)?),
-                    is_final: row.get(5)?,
-                    revision: row.get(6)?,
-                    failed: row.get(7)?,
-                })
-            })?
+            .prepare(&format!(
+                "{SELECT_SEGMENT} WHERE hearing_id = ?1 ORDER BY t_start_ms, id"
+            ))?
+            .query_map([hearing_id], row_to_segment)?
             .collect()
+    }
+
+    pub fn segment(&self, id: i64) -> rusqlite::Result<Segment> {
+        self.conn.query_row(
+            &format!("{SELECT_SEGMENT} WHERE id = ?1"),
+            [id],
+            row_to_segment,
+        )
+    }
+
+    /// The text of the last final segment of an other speaker before `t_start_ms`: usually the
+    /// question that the accused answers.
+    pub fn question_before(
+        &self,
+        hearing_id: i64,
+        t_start_ms: i64,
+    ) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT text FROM segments
+                 WHERE hearing_id = ?1 AND t_start_ms < ?2 AND speaker = 'other' AND final = 1
+                   AND failed = 0
+                 ORDER BY t_start_ms DESC, id DESC LIMIT 1",
+                params![hearing_id, t_start_ms],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// One chunk of evidence text, with its file and page.
+    pub fn chunk(&self, id: i64) -> rusqlite::Result<ChunkSource> {
+        self.conn.query_row(
+            "SELECT c.id, c.evidence_id, e.name, c.page, c.text
+             FROM chunks c JOIN evidence e ON e.id = c.evidence_id WHERE c.id = ?1",
+            [id],
+            |row| {
+                Ok(ChunkSource {
+                    id: row.get(0)?,
+                    evidence_id: row.get(1)?,
+                    evidence_name: row.get(2)?,
+                    page: row.get(3)?,
+                    text: row.get(4)?,
+                })
+            },
+        )
+    }
+
+    /// Stores a new open suggestion. Returns it with the source of its evidence passage.
+    pub fn insert_suggestion(&self, new: &NewSuggestion) -> rusqlite::Result<Suggestion> {
+        self.conn.execute(
+            "INSERT INTO suggestions (hearing_id, segment_id, chunk_id, claim, evidence_quote,
+                 claim_quote, kind, level, nli_contradiction, explanation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())",
+            params![
+                new.hearing_id,
+                new.segment_id,
+                new.chunk_id,
+                new.claim,
+                new.evidence_quote,
+                new.claim_quote,
+                new.kind.map(SuggestionKind::as_str),
+                new.level.as_str(),
+                new.nli_contradiction,
+                new.explanation,
+            ],
+        )?;
+        self.conn.query_row(
+            &format!("{SELECT_SUGGESTION} WHERE s.id = ?1"),
+            [self.conn.last_insert_rowid()],
+            row_to_suggestion,
+        )
+    }
+
+    /// The suggestions of a hearing: open first, then newest first.
+    pub fn suggestions(&self, hearing_id: i64) -> rusqlite::Result<Vec<Suggestion>> {
+        self.conn
+            .prepare(&format!(
+                "{SELECT_SUGGESTION} WHERE s.hearing_id = ?1
+                 ORDER BY s.status = 'open' DESC, s.created_at DESC, s.id DESC"
+            ))?
+            .query_map([hearing_id], row_to_suggestion)?
+            .collect()
+    }
+
+    pub fn set_suggestion_status(&self, id: i64, status: SuggestionStatus) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE suggestions SET status = ?1 WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn suggestion_counts(&self, hearing_id: i64) -> rusqlite::Result<SuggestionCounts> {
+        self.conn.query_row(
+            "SELECT count(*) FILTER (WHERE level = 'conflict'),
+                    count(*) FILTER (WHERE level = 'check')
+             FROM suggestions WHERE hearing_id = ?1 AND status = 'open'",
+            [hearing_id],
+            |row| {
+                Ok(SuggestionCounts {
+                    conflict: row.get(0)?,
+                    check: row.get(1)?,
+                })
+            },
+        )
     }
 }
 
@@ -825,22 +1146,27 @@ fn add_segment_columns(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn delete_analysis(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    // A suggestion without its evidence passage has no source, so it goes with the chunks.
+    conn.execute(
+        "DELETE FROM suggestions WHERE chunk_id IN (SELECT id FROM chunks WHERE evidence_id = ?1)",
+        [id],
+    )?;
     conn.execute("DELETE FROM chunks WHERE evidence_id = ?1", [id])?;
     conn.execute("DELETE FROM evidence_pages WHERE evidence_id = ?1", [id])?;
     Ok(())
 }
 
-/// Converts user input to an FTS5 query: each word becomes a quoted prefix term, so that
-/// quotes and operators in the input have no special meaning. Returns `None` if no word
-/// has a letter or a digit.
-fn fts_query(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
+/// Converts words to an FTS5 query: each word becomes a quoted prefix term, so that quotes and
+/// operators in the input have no special meaning. The terms are joined with `joiner`: a
+/// space (all terms must match) or `" OR "`. Returns `None` if no word has a letter or a digit.
+fn fts_query(words: &[&str], joiner: &str) -> Option<String> {
+    let terms: Vec<String> = words
+        .iter()
         .map(|word| word.replace('"', ""))
         .filter(|word| word.chars().any(char::is_alphanumeric))
         .map(|word| format!("\"{word}\"*"))
         .collect();
-    (!terms.is_empty()).then(|| terms.join(" "))
+    (!terms.is_empty()).then(|| terms.join(joiner))
 }
 
 /// True if the stored pages of a file of this type are physical pages: a PDF or an image. A DOCX
@@ -863,6 +1189,42 @@ pub fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn row_to_segment(row: &rusqlite::Row) -> rusqlite::Result<Segment> {
+    Ok(Segment {
+        id: row.get(0)?,
+        t_start_ms: row.get(1)?,
+        t_end_ms: row.get(2)?,
+        text: row.get(3)?,
+        speaker: Speaker::parse(&row.get::<_, String>(4)?),
+        is_final: row.get(5)?,
+        revision: row.get(6)?,
+        failed: row.get(7)?,
+    })
+}
+
+fn row_to_suggestion(row: &rusqlite::Row) -> rusqlite::Result<Suggestion> {
+    Ok(Suggestion {
+        id: row.get(0)?,
+        hearing_id: row.get(1)?,
+        segment_id: row.get(2)?,
+        chunk_id: row.get(3)?,
+        evidence_id: row.get(4)?,
+        evidence_name: row.get(5)?,
+        page: row.get(6)?,
+        claim: row.get(7)?,
+        claim_quote: row.get(8)?,
+        evidence_quote: row.get(9)?,
+        kind: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .and_then(SuggestionKind::parse),
+        level: SuggestionLevel::parse(&row.get::<_, String>(11)?),
+        nli_contradiction: row.get(12)?,
+        explanation: row.get(13)?,
+        status: SuggestionStatus::parse(&row.get::<_, String>(14)?),
+    })
 }
 
 fn row_to_hearing(row: &rusqlite::Row) -> rusqlite::Result<Hearing> {
@@ -898,7 +1260,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, SCHEMA_V2, Speaker, Store,
+        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, NewSuggestion, SCHEMA_V2,
+        Speaker, Store, SuggestionCounts, SuggestionKind, SuggestionLevel, SuggestionStatus,
         locator_label,
     };
     use crate::extract::{Page, PageSource};
@@ -1215,6 +1578,27 @@ mod tests {
     }
 
     #[test]
+    fn search_any_takes_two_passages_from_one_file_before_it_fills_by_rank() {
+        let (store, case) = store_with_case();
+        let large = import(&store, case, &temp_file("grande.txt", b"x"));
+        store
+            .save_analysis(large, &[text_page(1, &"El testigo habló. ".repeat(20_000))])
+            .unwrap();
+        let small = import(&store, case, &temp_file("acta.txt", b"x"));
+        store
+            .save_analysis(small, &[text_page(1, &long_page_with("testigo"))])
+            .unwrap();
+        let words = ["testigo".to_owned()];
+
+        let hits = store.search_any(case, &words, 5).unwrap();
+
+        let ids: Vec<i64> = hits.iter().map(|hit| hit.evidence_id).collect();
+        assert_eq!(ids, [large, large, small, large, large]);
+        assert!(hits[..2].iter().all(|hit| hit.rank <= hits[2].rank));
+        assert!(hits[3..].iter().all(|hit| hit.rank <= hits[2].rank));
+    }
+
+    #[test]
     fn delete_removes_the_evidence_with_its_pages_and_chunks() {
         let (store, case) = store_with_case();
         let id = import(&store, case, &temp_file("gone.txt", b"x"));
@@ -1325,7 +1709,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(old_table, 0);
     }
 
@@ -1421,6 +1805,29 @@ mod tests {
         assert_eq!(store.list(1).unwrap()[0].name, "acta.txt");
         let hearing = store.create_hearing(1, "Audiencia").unwrap();
         assert_eq!(store.hearings(1).unwrap()[0].id, hearing.id);
+    }
+
+    #[test]
+    fn a_version_3_database_keeps_its_hearings_and_gets_suggestions() {
+        let dir = std::env::temp_dir().join(format!("nicolaw-v3-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v3.db");
+        let _ = fs::remove_file(&db);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(super::SCHEMA_V2).unwrap();
+        conn.execute_batch(super::SCHEMA_V3).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 3;
+             INSERT INTO cases VALUES (1, 'Caso', 0);
+             INSERT INTO hearings (id, case_id, title) VALUES (1, 1, 'Audiencia');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        assert_eq!(store.hearings(1).unwrap()[0].title, "Audiencia");
+        assert!(store.suggestions(1).unwrap().is_empty());
     }
 
     #[test]
@@ -1645,5 +2052,267 @@ mod tests {
                 .iter()
                 .all(|part| part.chars().all(|c| c.is_ascii_digit()))
         );
+    }
+
+    /// A store with one case, one analyzed evidence file, and one hearing with one accused
+    /// segment. Returns the store, the hearing id, the segment id, and the chunk id.
+    fn store_with_hearing_and_evidence() -> (Store, i64, i64, i64, i64) {
+        let (store, case) = store_with_case();
+        let evidence = import(&store, case, &temp_file("acta.txt", b"x"));
+        store
+            .save_analysis(
+                evidence,
+                &[text_page(1, "Primera página."), text_page(2, DECLARATION)],
+            )
+            .unwrap();
+        let chunk = store.search(case, "declaracion", 1).unwrap()[0].chunk_id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store
+            .insert_segment(hearing, 1_000, Speaker::Accused)
+            .unwrap();
+        store
+            .finish_segment(segment, "Yo estaba en Medellín el 12 de marzo.", 4_000)
+            .unwrap();
+        (store, hearing, segment, chunk, evidence)
+    }
+
+    fn suggestion(
+        hearing_id: i64,
+        segment_id: i64,
+        chunk_id: i64,
+        level: SuggestionLevel,
+    ) -> NewSuggestion {
+        NewSuggestion {
+            hearing_id,
+            segment_id,
+            chunk_id,
+            claim: "El acusado estaba en Medellín el 12 de marzo.".into(),
+            claim_quote: Some("en Medellín".into()),
+            evidence_quote: "rendida el 12 de marzo de 2024 en Bogotá".into(),
+            kind: Some(SuggestionKind::Location),
+            level,
+            nli_contradiction: 0.93,
+            explanation: Some("La prueba ubica la declaración en Bogotá.".into()),
+        }
+    }
+
+    #[test]
+    fn a_suggestion_is_stored_with_its_source_file_and_page() {
+        let (store, hearing, segment, chunk, evidence) = store_with_hearing_and_evidence();
+
+        let stored = store
+            .insert_suggestion(&suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap();
+
+        assert_eq!(stored.hearing_id, hearing);
+        assert_eq!(stored.segment_id, segment);
+        assert_eq!(stored.chunk_id, chunk);
+        assert_eq!(stored.evidence_id, evidence);
+        assert_eq!(stored.evidence_name, "acta.txt");
+        assert_eq!(stored.page, 2);
+        assert_eq!(
+            stored.claim,
+            "El acusado estaba en Medellín el 12 de marzo."
+        );
+        assert_eq!(stored.claim_quote.as_deref(), Some("en Medellín"));
+        assert_eq!(
+            stored.evidence_quote,
+            "rendida el 12 de marzo de 2024 en Bogotá"
+        );
+        assert_eq!(stored.kind, Some(SuggestionKind::Location));
+        assert_eq!(stored.level, SuggestionLevel::Conflict);
+        assert_eq!(stored.nli_contradiction, 0.93);
+        assert_eq!(
+            stored.explanation.as_deref(),
+            Some("La prueba ubica la declaración en Bogotá.")
+        );
+        assert_eq!(stored.status, SuggestionStatus::Open);
+        assert_eq!(store.suggestions(hearing).unwrap()[0].id, stored.id);
+    }
+
+    #[test]
+    fn a_suggestion_can_have_no_quote_kind_or_explanation() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let mut new = suggestion(hearing, segment, chunk, SuggestionLevel::Check);
+        new.claim_quote = None;
+        new.kind = None;
+        new.explanation = None;
+
+        let stored = store.insert_suggestion(&new).unwrap();
+
+        assert_eq!(stored.claim_quote, None);
+        assert_eq!(stored.kind, None);
+        assert_eq!(stored.explanation, None);
+        assert_eq!(stored.level, SuggestionLevel::Check);
+    }
+
+    #[test]
+    fn suggestions_list_open_first_then_newest_first() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let first = store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap()
+            .id;
+        let second = store
+            .insert_suggestion(&suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap()
+            .id;
+        let third = store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap()
+            .id;
+
+        store
+            .set_suggestion_status(third, SuggestionStatus::Dismissed)
+            .unwrap();
+
+        let ids: Vec<i64> = store
+            .suggestions(hearing)
+            .unwrap()
+            .iter()
+            .map(|suggestion| suggestion.id)
+            .collect();
+        assert_eq!(ids, [second, first, third]);
+        assert_eq!(
+            store.suggestions(hearing).unwrap()[2].status,
+            SuggestionStatus::Dismissed
+        );
+    }
+
+    #[test]
+    fn counts_have_the_open_conflicts_and_the_open_checks() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let add = |level| {
+            store
+                .insert_suggestion(&suggestion(hearing, segment, chunk, level))
+                .unwrap()
+                .id
+        };
+        add(SuggestionLevel::Conflict);
+        let confirmed = add(SuggestionLevel::Conflict);
+        add(SuggestionLevel::Check);
+        add(SuggestionLevel::Check);
+        let dismissed = add(SuggestionLevel::Check);
+        store
+            .set_suggestion_status(confirmed, SuggestionStatus::Confirmed)
+            .unwrap();
+        store
+            .set_suggestion_status(dismissed, SuggestionStatus::Dismissed)
+            .unwrap();
+
+        assert_eq!(
+            store.suggestion_counts(hearing).unwrap(),
+            SuggestionCounts {
+                conflict: 1,
+                check: 2
+            }
+        );
+    }
+
+    #[test]
+    fn delete_hearing_removes_its_suggestions() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        store
+            .insert_suggestion(&suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap();
+
+        store.delete_hearing(hearing).unwrap();
+
+        assert!(store.suggestions(hearing).unwrap().is_empty());
+        assert_eq!(
+            store.suggestion_counts(hearing).unwrap(),
+            SuggestionCounts::default()
+        );
+    }
+
+    #[test]
+    fn delete_evidence_removes_the_suggestions_of_its_chunks() {
+        let (store, hearing, segment, chunk, evidence) = store_with_hearing_and_evidence();
+        store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap();
+
+        store.delete(evidence).unwrap();
+
+        assert!(store.suggestions(hearing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_chunk_gives_its_text_and_its_source() {
+        let (store, _, _, chunk, evidence) = store_with_hearing_and_evidence();
+
+        let source = store.chunk(chunk).unwrap();
+
+        assert_eq!(source.id, chunk);
+        assert_eq!(source.evidence_id, evidence);
+        assert_eq!(source.evidence_name, "acta.txt");
+        assert_eq!(source.page, 2);
+        assert_eq!(source.text, DECLARATION);
+    }
+
+    #[test]
+    fn a_segment_is_read_by_id_with_the_question_before_it() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let add = |t: i64, speaker, text: &str| {
+            let id = store.insert_segment(hearing, t, speaker).unwrap();
+            store.finish_segment(id, text, t + 500).unwrap();
+            id
+        };
+        add(0, Speaker::Other, "¿Dónde estaba usted?");
+        add(1_000, Speaker::Other, "¿Dónde estaba el 12 de marzo?");
+        add(2_000, Speaker::Accused, "No recuerdo.");
+        let answer = add(3_000, Speaker::Accused, "Estaba en Medellín.");
+        let first = store.insert_segment(hearing, 0, Speaker::Accused).unwrap();
+
+        let segment = store.segment(answer).unwrap();
+
+        assert_eq!(segment.text, "Estaba en Medellín.");
+        assert_eq!(segment.speaker, Speaker::Accused);
+        assert_eq!(
+            store.question_before(hearing, 3_000).unwrap().as_deref(),
+            Some("¿Dónde estaba el 12 de marzo?")
+        );
+        assert_eq!(store.question_before(hearing, 0).unwrap(), None);
+        assert!(store.segment(first + 100).is_err());
+    }
+
+    #[test]
+    fn search_any_finds_chunks_with_some_of_the_words_best_first() {
+        let (store, case) = store_with_case();
+        let evidence = import(&store, case, &temp_file("acta.txt", b"x"));
+        store
+            .save_analysis(
+                evidence,
+                &[
+                    text_page(1, "El testigo vio un carro rojo."),
+                    text_page(2, DECLARATION),
+                    text_page(3, "El acusado vive en Bogotá desde marzo."),
+                ],
+            )
+            .unwrap();
+        let words = ["acusado", "12", "marzo", "medellín", "\"OR", "*"].map(String::from);
+
+        let hits = store.search_any(case, &words, 20).unwrap();
+
+        let pages: Vec<u32> = hits.iter().map(|hit| hit.page).collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], 2, "the chunk with more words is first");
+        assert!(store.search_any(case, &[], 20).unwrap().is_empty());
     }
 }

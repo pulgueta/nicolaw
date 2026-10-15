@@ -2,6 +2,7 @@ mod analysis;
 mod app;
 mod audio;
 mod extract;
+mod hearings;
 mod models;
 mod preview;
 mod store;
@@ -10,7 +11,12 @@ mod transfer;
 use gpui_kit::component::Theme;
 use gpui_kit::*;
 
+use std::sync::Arc;
+
 use crate::app::FilesView;
+use crate::audio::native::NativeBackend;
+use crate::hearings::HearingsEnv;
+use crate::models::ModelDirs;
 use crate::store::Store;
 
 actions!(nicolaw, [Quit]);
@@ -31,6 +37,11 @@ fn main() {
         Store::open(&data_dir.join("nicolaw.db")).expect("Nicolaw cannot open the database");
     // Copies that Abrir wrote in an earlier run. A failure here does not stop the app.
     app::remove_open_copies(&app::open_copies_dir()).ok();
+    let hearings_env = HearingsEnv {
+        backend: Arc::new(NativeBackend),
+        model_dirs: ModelDirs::system(),
+        data_dir: data_dir.clone(),
+    };
 
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
@@ -53,7 +64,7 @@ fn main() {
             ..Default::default()
         };
         open_window(options, cx, |window, cx| {
-            cx.new(|cx| FilesView::new(store, window, cx))
+            cx.new(|cx| FilesView::new(store, hearings_env, window, cx))
         })
         .expect("Nicolaw cannot open the window");
     });

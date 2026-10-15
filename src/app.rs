@@ -37,6 +37,7 @@ use gpui_kit::*;
 
 use crate::analysis;
 use crate::extract::{Page, PageSource};
+use crate::hearings::{HearingsEnv, HearingsView};
 use crate::preview::{self, Preview};
 use crate::store::{
     AnalysisStatus, Case, Evidence, ImportError, SearchGroup, SearchHit, Store, file_name,
@@ -81,6 +82,13 @@ enum NameNote {
     Duplicate(String),
 }
 
+/// The top-level screen of the selected case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Screen {
+    Evidence,
+    Hearings,
+}
+
 /// One case in the case select.
 #[derive(Clone)]
 struct CaseItem {
@@ -106,6 +114,8 @@ pub struct FilesView {
     cases: Vec<Case>,
     case_id: Option<i64>,
     case_select: Entity<SelectState<Vec<CaseItem>>>,
+    screen: Screen,
+    hearings: Entity<HearingsView>,
     search: Entity<InputState>,
     /// The trimmed search text. While it is not empty, the list shows the search hits.
     query: String,
@@ -148,9 +158,15 @@ pub struct FilesView {
 }
 
 impl FilesView {
-    pub fn new(store: Store, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Store,
+        hearings_env: HearingsEnv,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let store = Arc::new(Mutex::new(store));
         let case_select = cx.new(|cx| SelectState::new(Vec::<CaseItem>::new(), None, window, cx));
+        let hearings = cx.new(|cx| HearingsView::new(store.clone(), hearings_env, window, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar en las pruebas…"));
         let subscriptions = vec![
             cx.subscribe_in(
@@ -212,6 +228,8 @@ impl FilesView {
             cases: Vec::new(),
             case_id: None,
             case_select,
+            screen: Screen::Evidence,
+            hearings,
             search,
             query: String::new(),
             groups: Vec::new(),
@@ -280,6 +298,8 @@ impl FilesView {
         self.search
             .update(cx, |search, cx| search.set_value("", window, cx));
         self.list_loaded = false;
+        self.hearings
+            .update(cx, |hearings, cx| hearings.set_case(Some(id), window, cx));
         cx.notify();
 
         let store = self.store.clone();
@@ -956,21 +976,58 @@ impl FilesView {
                                 this.open_new_case_dialog(window, cx)
                             })),
                     )
-                    .children(count.map(|count| div().text_sm().text_color(muted).child(count)))
-                    .children(
-                        summary
-                            .map(|summary| div().ml_2().text_sm().text_color(muted).child(summary)),
-                    ),
+                    .child(
+                        div().ml_4().child(
+                            TabBar::new("screen-tabs")
+                                .segmented()
+                                .selected_index(match self.screen {
+                                    Screen::Evidence => 0,
+                                    Screen::Hearings => 1,
+                                })
+                                .on_click(cx.listener(|this, index: &usize, _, cx| {
+                                    this.screen = if *index == 0 {
+                                        Screen::Evidence
+                                    } else {
+                                        Screen::Hearings
+                                    };
+                                    cx.notify();
+                                }))
+                                .child(tabs::Tab::new().child(
+                                    div().id("screen-evidence").child("Pruebas").test_support(),
+                                ))
+                                .child(
+                                    tabs::Tab::new().child(
+                                        div()
+                                            .id("screen-hearings")
+                                            .child("Audiencias")
+                                            .test_support(),
+                                    ),
+                                ),
+                        ),
+                    )
+                    .when(self.screen == Screen::Evidence, |header| {
+                        header
+                            .children(
+                                count.map(|count| div().text_sm().text_color(muted).child(count)),
+                            )
+                            .children(summary.map(|summary| {
+                                div().ml_2().text_sm().text_color(muted).child(summary)
+                            }))
+                    }),
             )
-            .child(
-                Button::new("add-files")
-                    .flex_none()
-                    .primary()
-                    .icon(IconName::Plus)
-                    .label("Agregar archivos")
-                    .disabled(self.case_id.is_none())
-                    .on_click(cx.listener(|this, _, window, cx| this.prompt_for_files(window, cx))),
-            )
+            .when(self.screen == Screen::Evidence, |header| {
+                header.child(
+                    Button::new("add-files")
+                        .flex_none()
+                        .primary()
+                        .icon(IconName::Plus)
+                        .label("Agregar archivos")
+                        .disabled(self.case_id.is_none())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.prompt_for_files(window, cx)),
+                        ),
+                )
+            })
             // Absolute, so that the header height does not change when the bar shows.
             .when(!self.queue.is_empty(), |header| {
                 header.child(
@@ -1649,6 +1706,12 @@ impl Render for FilesView {
                 "No hay casos",
                 "Cree un caso para agregar pruebas. Seleccione Nuevo caso.",
             )
+        } else if self.screen == Screen::Hearings {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(self.hearings.clone())
+                .into_any_element()
         } else if self.list_loaded
             && self.files.is_empty()
             && self.queue.is_empty()
@@ -1713,15 +1776,29 @@ mod tests {
         WindowOptions, px, size,
     };
 
+    use std::sync::Arc;
+
     use super::{
         FilesView, Loaded, Tab, case_title, remove_open_copies, remove_open_copy, write_open_copy,
     };
+    use crate::audio::fake::FakeBackend;
     use crate::extract::{Page, PageSource};
+    use crate::hearings::HearingsEnv;
+    use crate::models::ModelDirs;
     use crate::store::{AnalysisStatus, Store};
 
     const WAIT: Duration = Duration::from_secs(1);
 
     fn open(store: Store, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<FilesView>) {
+        let dir = temp_dir("hearings-env");
+        let env = HearingsEnv {
+            backend: Arc::new(FakeBackend::new("")),
+            model_dirs: ModelDirs {
+                hf_cache: dir.join("hub"),
+                handy: dir.join("handy"),
+            },
+            data_dir: dir.join("data"),
+        };
         cx.update(|cx| {
             gpui_kit::init(cx);
             let options = WindowOptions {
@@ -1732,7 +1809,7 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| FilesView::new(store, window, cx))
+                cx.new(|cx| FilesView::new(store, env, window, cx))
             })
             .unwrap()
         })
@@ -2414,5 +2491,35 @@ mod tests {
             }
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn the_hearings_tab_shows_the_hearings_of_the_case(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let hearing = store
+            .create_hearing(case, "Audiencia de prueba")
+            .unwrap()
+            .id;
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, _| {
+            assert!(window.try_find("add-files").is_none());
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| window.click("screen-evidence", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("hearings").is_none() && window.try_find("empty-state").is_some()
+        })
+        .await;
     }
 }

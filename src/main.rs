@@ -1,5 +1,6 @@
 mod analysis;
 mod app;
+mod audio;
 mod extract;
 mod models;
 mod preview;

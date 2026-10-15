@@ -1,0 +1,25 @@
+[package]
+name = "nicolaw"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-channel = "2.5"
+dirs = "7.0.0"
+gpui-kit = "0.7"
+mime_guess = "2.0.5"
+rusqlite = { version = "0.40.2", features = ["blob", "bundled"] }
+
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+
+[dev-dependencies]
+gpui-kit = { version = "0.7", features = ["test-support"] }

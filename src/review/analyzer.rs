@@ -1,7 +1,7 @@
 //! The analysis of one segment, and the bounded queue of segments that wait for it.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_channel::TrySendError;
@@ -52,6 +52,8 @@ pub struct Analyzer {
     store: Arc<Mutex<Store>>,
     llm: Box<dyn Llm>,
     nli: Box<dyn Nli>,
+    /// When true, the analysis stops before the next model call or the next insert.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Analyzer {
@@ -60,42 +62,72 @@ impl Analyzer {
             store,
             llm: engines.llm,
             nli: engines.nli,
+            cancel: Arc::default(),
         }
     }
 
-    /// Analyzes one segment: claims, retrieval, NLI, explanation, and storage. Returns the new
-    /// suggestions, or one error. A segment of an other speaker, or a segment whose text
-    /// changed, gives nothing.
-    pub fn analyze(&mut self, job: &Job) -> Vec<ReviewEvent> {
-        self.try_analyze(job)
-            .unwrap_or_else(|error| vec![ReviewEvent::Error(error.message().into())])
+    /// The analysis stops when `cancel` becomes true.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
-    fn try_analyze(&mut self, job: &Job) -> Result<Vec<ReviewEvent>, ReviewError> {
+    /// Analyzes one segment: claims, retrieval, NLI, explanation, and storage. Returns the new
+    /// suggestions, then an error if the analysis failed. A segment of an other speaker, or a
+    /// segment whose text changed, gives nothing. The new suggestions of a segment replace its
+    /// old suggestions.
+    pub fn analyze(&mut self, job: &Job) -> Vec<ReviewEvent> {
+        let mut events = Vec::new();
+        if let Err(error) = self.try_analyze(job, &mut events) {
+            events.push(ReviewEvent::Error(error.message().into()));
+        }
+        events
+    }
+
+    fn try_analyze(&mut self, job: &Job, events: &mut Vec<ReviewEvent>) -> Result<(), ReviewError> {
+        if self.cancelled() {
+            return Ok(());
+        }
         let Some(segment) = self.current(job)? else {
-            return Ok(Vec::new());
+            return Ok(());
         };
+        let removed = self
+            .store
+            .lock()
+            .unwrap()
+            .delete_segment_suggestions(job.segment_id)?;
+        if removed > 0 {
+            events.push(ReviewEvent::SuggestionsRemoved {
+                hearing_id: job.hearing_id,
+            });
+        }
         let question = self
             .store
             .lock()
             .unwrap()
             .question_before(job.hearing_id, segment.t_start_ms)?;
         let claims = parse_claims(&self.llm.claims(question.as_deref(), &segment.text)?);
-        let mut events = Vec::new();
         for claim in claims {
             for flagged in self.flag(job.case_id, &claim)? {
+                if self.cancelled() {
+                    return Ok(());
+                }
                 let output = self.llm.explain(&claim, &flagged.premise)?;
                 let explanation = parse_explanation(&output, &claim, &flagged.chunk_text);
                 // The refine pass can change the text during the analysis.
-                if self.current(job)?.is_none() {
-                    return Ok(events);
+                if self.cancelled() || self.current(job)?.is_none() {
+                    return Ok(());
                 }
                 let new = suggestion(job, &claim, flagged, explanation);
                 let stored = self.store.lock().unwrap().insert_suggestion(&new)?;
                 events.push(ReviewEvent::SuggestionAdded(stored));
             }
         }
-        Ok(events)
+        Ok(())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// The segment of the job, if it is a final segment of the accused with the same text.
@@ -125,6 +157,9 @@ impl Analyzer {
             let chunk = self.store.lock().unwrap().chunk(hit.chunk_id)?;
             let mut best: Option<Flagged> = None;
             for premise in premises(&chunk.text) {
+                if self.cancelled() {
+                    return Ok(Vec::new());
+                }
                 // Both directions: the evidence as premise, then the claim as premise.
                 let scores = self
                     .nli
@@ -212,6 +247,13 @@ impl JobQueue {
     }
 
     pub fn push(&self, mut job: Job) {
+        // A new job for a segment replaces its pending job: the text of the segment changed.
+        let pending: Vec<Job> = std::iter::from_fn(|| self.receiver.try_recv().ok()).collect();
+        for old in pending {
+            if old.segment_id != job.segment_id {
+                self.sender.try_send(old).ok();
+            }
+        }
         loop {
             match self.sender.try_send(job) {
                 Ok(()) | Err(TrySendError::Closed(_)) => return,
@@ -280,6 +322,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use super::{Analyzer, Job, JobQueue, text_hash};
@@ -552,6 +595,101 @@ mod tests {
             events,
             [ReviewEvent::Error(ReviewError::Inference.message().into())]
         );
+    }
+
+    #[test]
+    fn an_error_after_a_stored_suggestion_reports_the_suggestion_and_the_error() {
+        let case = seeded("partial-error");
+        let mut llm = FakeLlm::new(
+            &serde_json::json!([CLAIM, CLAIM]).to_string(),
+            &explanation(true, "en Medellín", "estaba en Bogotá"),
+        );
+        llm.fail_explain_from = Some(1);
+        let mut analyzer = analyzer(&case, &llm, nli(0.95));
+
+        let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
+
+        let stored = case
+            .store
+            .lock()
+            .unwrap()
+            .suggestions(case.hearing)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            events,
+            [
+                ReviewEvent::SuggestionAdded(stored[0].clone()),
+                ReviewEvent::Error(ReviewError::Inference.message().into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_analysis_calls_no_model_and_stores_nothing() {
+        let case = seeded("cancelled");
+        let llm = llm(&explanation(true, "en Medellín", "estaba en Bogotá"));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut analyzer = analyzer(&case, &llm, nli(0.95)).with_cancel(cancel);
+
+        let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
+
+        assert!(events.is_empty(), "{events:?}");
+        assert!(llm.calls().is_empty());
+    }
+
+    #[test]
+    fn a_new_analysis_of_a_segment_replaces_its_old_suggestions() {
+        let case = seeded("replace");
+        let llm = llm(&explanation(true, "en Medellín", "estaba en Bogotá"));
+        let mut analyzer = analyzer(&case, &llm, nli(0.95));
+        analyzer.analyze(&job(&case, case.answer, ANSWER));
+        let refined = "Ese día yo estaba en Medellín, señor juez.";
+        case.store
+            .lock()
+            .unwrap()
+            .set_segment_text(case.answer, refined)
+            .unwrap();
+
+        let events = analyzer.analyze(&job(&case, case.answer, refined));
+
+        let stored = case
+            .store
+            .lock()
+            .unwrap()
+            .suggestions(case.hearing)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            events,
+            [
+                ReviewEvent::SuggestionsRemoved {
+                    hearing_id: case.hearing
+                },
+                ReviewEvent::SuggestionAdded(stored[0].clone()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_job_for_a_segment_replaces_its_pending_job() {
+        let queue = JobQueue::new(4);
+        let job = |segment_id, text_hash| Job {
+            case_id: 1,
+            hearing_id: 1,
+            segment_id,
+            text_hash,
+        };
+
+        queue.push(job(1, 10));
+        queue.push(job(2, 20));
+        queue.push(job(1, 11));
+
+        let next: Vec<(i64, u64)> = std::iter::from_fn(|| queue.try_next())
+            .map(|job| (job.segment_id, job.text_hash))
+            .collect();
+        assert_eq!(next, [(2, 20), (1, 11)]);
+        assert_eq!(queue.dropped(), 0);
     }
 
     #[test]

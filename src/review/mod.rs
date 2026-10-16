@@ -17,6 +17,10 @@ use crate::store::{Suggestion, SuggestionLevel};
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReviewEvent {
     SuggestionAdded(Suggestion),
+    /// A new analysis of a segment removed the old suggestions of the segment.
+    SuggestionsRemoved {
+        hearing_id: i64,
+    },
     /// The number of segments that wait for analysis (with the segment in analysis), and the
     /// number of segments that the full queue dropped.
     Progress {

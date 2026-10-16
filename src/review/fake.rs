@@ -12,6 +12,8 @@ pub struct FakeLlm {
     pub claims: String,
     pub explanation: String,
     pub fail: bool,
+    /// The explanation call with this index (from 0), and each call after it, fails.
+    pub fail_explain_from: Option<usize>,
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -21,6 +23,7 @@ impl FakeLlm {
             claims: claims.to_owned(),
             explanation: explanation.to_owned(),
             fail: false,
+            fail_explain_from: None,
             calls: Arc::default(),
         }
     }
@@ -43,10 +46,15 @@ impl Llm for FakeLlm {
     }
 
     fn explain(&mut self, claim: &str, passage: &str) -> Result<String, ReviewError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("explain|{claim}|{passage}"));
+        let mut calls = self.calls.lock().unwrap();
+        let index = calls
+            .iter()
+            .filter(|call| call.starts_with("explain|"))
+            .count();
+        calls.push(format!("explain|{claim}|{passage}"));
+        if self.fail_explain_from.is_some_and(|from| index >= from) {
+            return Err(ReviewError::Inference);
+        }
         Ok(self.explanation.clone())
     }
 }
@@ -87,6 +95,8 @@ type LoadedFiles = (Vec<PathBuf>, Vec<PathBuf>);
 pub struct FakeReviewBackend {
     pub llm: FakeLlm,
     pub nli: FakeNli,
+    /// When true, the load fails as with damaged model files.
+    pub fail: bool,
     pub loaded: Arc<Mutex<Option<LoadedFiles>>>,
 }
 
@@ -95,6 +105,7 @@ impl FakeReviewBackend {
         Self {
             llm,
             nli,
+            fail: false,
             loaded: Arc::default(),
         }
     }
@@ -103,6 +114,9 @@ impl FakeReviewBackend {
 impl ReviewBackend for FakeReviewBackend {
     fn load(&self, nli: &[PathBuf], llm: &[PathBuf]) -> Result<Engines, ReviewError> {
         *self.loaded.lock().unwrap() = Some((nli.to_vec(), llm.to_vec()));
+        if self.fail {
+            return Err(ReviewError::ModelLoad);
+        }
         Ok(Engines {
             llm: Box::new(self.llm.clone()),
             nli: Box::new(self.nli.clone()),

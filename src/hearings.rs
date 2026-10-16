@@ -1194,6 +1194,8 @@ struct Review {
     queue: JobQueue,
     /// The analysis task. `None` while the models load: the queue keeps the segments.
     task: Option<Task<()>>,
+    /// Stops the analysis of the current segment when the switch turns off.
+    cancel: Arc<AtomicBool>,
 }
 
 /// The text of the open segment.
@@ -2182,6 +2184,7 @@ impl HearingsView {
         self.review = Some(Review {
             queue: queue.clone(),
             task: None,
+            cancel: Arc::default(),
         });
         let backend = self.env.review.clone();
         cx.spawn(async move |this, cx| {
@@ -2208,7 +2211,8 @@ impl HearingsView {
                     }
                     Some(Ok(engines)) => {
                         let (events, receiver) = async_channel::unbounded();
-                        let analyzer = Analyzer::new(this.store.clone(), engines);
+                        let analyzer = Analyzer::new(this.store.clone(), engines)
+                            .with_cancel(review.cancel.clone());
                         review.task =
                             Some(cx.background_spawn(analyzer::run(analyzer, queue, events)));
                         this.listen_review(receiver, cx);
@@ -2216,6 +2220,11 @@ impl HearingsView {
                     Some(Err(error)) => {
                         this.review = None;
                         this.message = Some(error.message().into());
+                        // Damaged files: show the models as not installed, so that the panel
+                        // offers the downloads and the switch shows off.
+                        for (_, files) in this.analysis_models.iter_mut().flatten() {
+                            *files = None;
+                        }
                     }
                 }
                 cx.notify();
@@ -2229,6 +2238,7 @@ impl HearingsView {
     fn stop_review(&mut self) {
         if let Some(review) = self.review.take() {
             review.queue.close();
+            review.cancel.store(true, Ordering::Relaxed);
         }
         self.review_pending = 0;
     }
@@ -2267,6 +2277,11 @@ impl HearingsView {
             ReviewEvent::SuggestionAdded(suggestion) => {
                 if self.selected == Some(suggestion.hearing_id) {
                     self.load_suggestions(suggestion.hearing_id, cx);
+                }
+            }
+            ReviewEvent::SuggestionsRemoved { hearing_id } => {
+                if self.selected == Some(hearing_id) {
+                    self.load_suggestions(hearing_id, cx);
                 }
             }
             ReviewEvent::Progress { pending, dropped } => {
@@ -3379,8 +3394,8 @@ mod tests {
     use crate::models::{
         ANALYSIS_MODELS, COHERE, ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model,
     };
-    use crate::review::ReviewEvent;
     use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
+    use crate::review::{ReviewError, ReviewEvent};
     use crate::store::{
         NewSuggestion, Segment, Speaker, Store, SuggestionCounts, SuggestionLevel, SuggestionStatus,
     };
@@ -4364,6 +4379,68 @@ mod tests {
         assert_eq!(llm.calls()[0], format!("claims||{ANSWER}"));
         let loaded = review.loaded.lock().unwrap().clone().unwrap();
         assert_eq!((loaded.0.len(), loaded.1.len()), (3, 2));
+    }
+
+    /// Opens a view with installed analysis models, selects a new hearing, and starts the
+    /// recording. Returns the window, the view, and the hearing.
+    async fn record_with_analysis(
+        name: &str,
+        review: &FakeReviewBackend,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<HearingsView>, i64) {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let backend = FakeBackend::new(ANSWER);
+        let dirs = model_dirs(name, true);
+        install_analysis_models(&dirs);
+        let (window, view) = open_with(name, store, case, &backend, review, &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).ready())
+            .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).analysis_on())
+            .await;
+        click(cx, window, "start");
+        cx.wait_for(window, WAIT, |_, _| backend.input.lock().unwrap().is_some())
+            .await;
+        (window, view, hearing)
+    }
+
+    #[gpui_kit::test]
+    async fn analysis_models_that_do_not_load_show_the_downloads_again(cx: &mut TestAppContext) {
+        let mut review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        review.fail = true;
+
+        let (window, view, _) = record_with_analysis("analysis-broken", &review, cx).await;
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("download-nli").is_some() && window.try_find("download-llm").is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(!view.analysis_on());
+            assert_eq!(view.message, Some(ReviewError::ModelLoad.message().into()));
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn the_switch_off_cancels_the_running_analysis(cx: &mut TestAppContext) {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        let (window, view, _) = record_with_analysis("analysis-cancel", &review, cx).await;
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.task.is_some())
+        })
+        .await;
+        let cancel = cx.update(|cx| view.read(cx).review.as_ref().unwrap().cancel.clone());
+
+        click(cx, window, "live-analysis");
+        cx.run_until_parked();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        cx.update(|cx| assert!(view.read(cx).review.is_none()));
     }
 
     #[gpui_kit::test]

@@ -1097,6 +1097,14 @@ impl Store {
             .collect()
     }
 
+    /// Deletes the suggestions of a segment. Returns the number of deleted suggestions.
+    pub fn delete_segment_suggestions(&self, segment_id: i64) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM suggestions WHERE segment_id = ?1",
+            [segment_id],
+        )
+    }
+
     pub fn set_suggestion_status(&self, id: i64, status: SuggestionStatus) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE suggestions SET status = ?1 WHERE id = ?2",

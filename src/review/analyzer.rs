@@ -8,7 +8,9 @@ use async_channel::TrySendError;
 
 use super::parse::{Explanation, parse_claims, parse_explanation, premises};
 use super::query::query_terms;
-use super::{Engines, Llm, Nli, ReviewError, ReviewEvent, decide};
+use super::{
+    Decider, DecisionScores, Engines, Llm, Nli, ReviewError, ReviewEvent, confirm, decide,
+};
 use crate::store::{AnalysisState, NewSuggestion, Segment, Speaker, Store, SuggestionLevel};
 
 /// The search gives at most this number of chunks for each claim.
@@ -54,6 +56,7 @@ pub struct Analyzer {
     nli: Box<dyn Nli>,
     /// When true, the analysis stops before the next model call or the next insert.
     cancel: Arc<AtomicBool>,
+    decider: Box<dyn Decider>,
     /// The right to keep the models loaded. It is the last field, so that it goes after the
     /// models.
     _permit: Option<Permit>,
@@ -86,6 +89,7 @@ impl Analyzer {
             store,
             llm: engines.llm,
             nli: engines.nli,
+            decider: engines.decider,
             cancel: Arc::default(),
             _permit: None,
         }
@@ -103,9 +107,9 @@ impl Analyzer {
         self
     }
 
-    /// Analyzes one segment: claims, retrieval, NLI, explanation, and storage. Returns the new
-    /// suggestions and the analysis state of the segment, then an error for the user if the
-    /// storage failed. A segment of an other speaker, or a segment whose text changed, gives
+    /// Analyzes one segment: claims, retrieval, NLI, decision, explanation, and storage.
+    /// Returns the new suggestions and the analysis state of the segment, then an error for the
+    /// user if the storage failed. A segment of an other speaker, or a segment whose text changed, gives
     /// nothing. The suggestions are stored only when the full analysis succeeds; earlier
     /// suggestions of the segment stay (see [`Store::replace_suggestions`]).
     pub fn analyze(&mut self, job: &Job) -> Vec<ReviewEvent> {
@@ -193,9 +197,13 @@ impl Analyzer {
                 if self.cancelled() {
                     return Err(Stop::Cancelled);
                 }
+                let decision = self.decider.decide(&claim, &flagged.premise)?;
+                if self.cancelled() {
+                    return Err(Stop::Cancelled);
+                }
                 let output = self.llm.explain(&claim, &flagged.premise)?;
                 let explanation = parse_explanation(&output, &claim, &flagged.chunk_text);
-                new.push(suggestion(job, &claim, flagged, explanation));
+                new.push(suggestion(job, &claim, flagged, decision, explanation));
             }
         }
         if self.cancelled() {
@@ -282,14 +290,18 @@ fn analyzed(job: &Job, state: AnalysisState) -> ReviewEvent {
     }
 }
 
-/// A conflict needs the NLI model and the language model to agree. Every other flagged pair is
-/// a check. Without a valid explanation, the suggestion shows the full premise and a note.
+/// A conflict needs the NLI model, the decision step, and the language model to agree. Every
+/// other flagged pair is a check. Without a valid explanation, the suggestion shows the full
+/// premise and a note.
 fn suggestion(
     job: &Job,
     claim: &str,
     flagged: Flagged,
+    decision: DecisionScores,
     explanation: Option<Explanation>,
 ) -> NewSuggestion {
+    let level = confirm(flagged.level, decision);
+    let (best, probability) = decision.best();
     let base = NewSuggestion {
         hearing_id: job.hearing_id,
         segment_id: job.segment_id,
@@ -303,11 +315,13 @@ fn suggestion(
         explanation: Some(UNVERIFIED_NOTE.to_owned()),
         // The store sets the revision that the analysis read.
         segment_revision: 0,
+        decision: Some(best),
+        decision_p: Some(probability as f64),
     };
     let Some(explanation) = explanation else {
         return base;
     };
-    let conflict = flagged.level == SuggestionLevel::Conflict && explanation.contradiction;
+    let conflict = level == SuggestionLevel::Conflict && explanation.contradiction;
     NewSuggestion {
         claim_quote: Some(explanation.quote_claim),
         evidence_quote: explanation.quote_evidence,
@@ -496,8 +510,8 @@ mod tests {
 
     use super::{Analyzer, Job, JobQueue, ModelGate, submit, text_hash};
     use crate::extract::{Page, PageSource};
-    use crate::review::fake::{FakeLlm, FakeNli};
-    use crate::review::{Engines, ReviewEvent};
+    use crate::review::fake::{FakeDecider, FakeLlm, FakeNli};
+    use crate::review::{Decision, DecisionScores, Engines, ReviewEvent};
     use crate::store::{
         AnalysisState, Speaker, Store, SuggestionKind, SuggestionLevel, SuggestionStatus,
     };
@@ -584,11 +598,16 @@ mod tests {
     }
 
     fn analyzer(case: &Case, llm: &FakeLlm, nli: FakeNli) -> Analyzer {
+        analyzer_with(case, llm, nli, &FakeDecider::contradicts())
+    }
+
+    fn analyzer_with(case: &Case, llm: &FakeLlm, nli: FakeNli, decider: &FakeDecider) -> Analyzer {
         Analyzer::new(
             case.store.clone(),
             Engines {
                 llm: Box::new(llm.clone()),
                 nli: Box::new(nli),
+                decider: Box::new(decider.clone()),
             },
         )
     }
@@ -620,7 +639,8 @@ mod tests {
             "en Medellín",
             "estaba en Bogotá el 12 de marzo de 2024",
         ));
-        let mut analyzer = analyzer(&case, &llm, nli(0.95));
+        let decider = FakeDecider::contradicts();
+        let mut analyzer = analyzer_with(&case, &llm, nli(0.95), &decider);
 
         let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
 
@@ -639,6 +659,10 @@ mod tests {
         assert_eq!(suggestion.evidence_name, "registro.txt");
         assert_eq!(suggestion.page, 1);
         assert_eq!(suggestion.nli_contradiction, 0.95f32 as f64);
+        assert_eq!(suggestion.decision, Some(Decision::Contradicts));
+        assert_eq!(suggestion.decision_p, Some(0.9f32 as f64));
+        // The decision step reads the flagged pair once.
+        assert_eq!(decider.calls(), [format!("decide|{CLAIM}|{HOTEL}")]);
         assert_eq!(
             case.store
                 .lock()
@@ -668,6 +692,52 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].level, SuggestionLevel::Check);
         assert_eq!(suggestions[0].claim_quote.as_deref(), Some("en Medellín"));
+    }
+
+    #[test]
+    fn a_conflict_is_a_check_when_the_decision_step_abstains() {
+        let case = seeded("abstain");
+        let llm = llm(&explanation(true, "en Medellín", "estaba en Bogotá"));
+        let decider = FakeDecider::new(DecisionScores {
+            contradicts: 0.3,
+            consistent: 0.1,
+            unrelated: 0.1,
+            insufficient: 0.5,
+        });
+        let mut analyzer = analyzer_with(&case, &llm, nli(0.95), &decider);
+
+        let suggestions = added(&analyzer.analyze(&job(&case, case.answer, ANSWER)));
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].level, SuggestionLevel::Check);
+        assert_eq!(suggestions[0].decision, Some(Decision::Insufficient));
+        assert_eq!(suggestions[0].decision_p, Some(0.5));
+    }
+
+    #[test]
+    fn a_check_keeps_its_decision_without_a_valid_explanation() {
+        let case = seeded("check-decision");
+        // The evidence quote is not in the chunk.
+        let llm = llm(&explanation(true, "en Medellín", "estuvo en Bogotá"));
+        let mut analyzer = analyzer(&case, &llm, nli(0.7));
+
+        let suggestions = added(&analyzer.analyze(&job(&case, case.answer, ANSWER)));
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].level, SuggestionLevel::Check);
+        assert_eq!(suggestions[0].decision, Some(Decision::Contradicts));
+    }
+
+    #[test]
+    fn a_claim_without_a_flagged_passage_gets_no_decision() {
+        let case = seeded("no-decision");
+        let llm = llm("{}");
+        let decider = FakeDecider::contradicts();
+        let mut analyzer = analyzer_with(&case, &llm, nli(0.3), &decider);
+
+        analyzer.analyze(&job(&case, case.answer, ANSWER));
+
+        assert!(decider.calls().is_empty());
     }
 
     #[test]

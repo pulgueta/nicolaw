@@ -15,7 +15,7 @@ use candle_transformers::models::quantized_qwen3::ModelWeights;
 use tokenizers::{Tokenizer, TruncationParams};
 
 use super::prompt::{claims_prompt, explain_prompt, json_end};
-use super::{Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError};
+use super::{Decider, DecisionScores, Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError};
 
 /// The NLI model reads at most this number of tokens for a pair.
 const NLI_MAX_TOKENS: usize = 512;
@@ -46,6 +46,7 @@ impl ReviewBackend for NativeReview {
             llm: Box::new(NativeLlm(ModelThread::spawn("nicolaw-llm", move || {
                 Qwen::load(&llm, device())
             })?)),
+            decider: Box::new(PassDecider),
         })
     }
 }
@@ -148,6 +149,21 @@ impl Nli for NativeNli {
         self.tokenizer
             .encode((premise, hypothesis), true)
             .is_ok_and(|encoding| encoding.len() <= NLI_MAX_TOKENS)
+    }
+}
+
+/// Confirms each contradiction, so that the analysis keeps the layer 3 behavior. The
+/// option-logit decision on Qwen3 replaces it.
+struct PassDecider;
+
+impl Decider for PassDecider {
+    fn decide(&mut self, _: &str, _: &str) -> Result<DecisionScores, ReviewError> {
+        Ok(DecisionScores {
+            contradicts: 1.0,
+            consistent: 0.0,
+            unrelated: 0.0,
+            insufficient: 0.0,
+        })
     }
 }
 

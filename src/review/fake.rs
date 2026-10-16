@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError};
+use super::{Decider, DecisionScores, Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError};
 
 /// A language model with fixed answers. It records each call as `claims|<question>|<text>` or
 /// `explain|<claim>|<passage>`.
@@ -108,6 +108,46 @@ impl Nli for FakeNli {
     }
 }
 
+/// A decision step with fixed scores. It records each call as `decide|<claim>|<passage>`.
+#[derive(Clone)]
+pub struct FakeDecider {
+    pub scores: DecisionScores,
+    pub calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeDecider {
+    pub fn new(scores: DecisionScores) -> Self {
+        Self {
+            scores,
+            calls: Arc::default(),
+        }
+    }
+
+    /// A decision step that confirms each contradiction.
+    pub fn contradicts() -> Self {
+        Self::new(DecisionScores {
+            contradicts: 0.9,
+            consistent: 0.04,
+            unrelated: 0.03,
+            insufficient: 0.03,
+        })
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Decider for FakeDecider {
+    fn decide(&mut self, claim: &str, passage: &str) -> Result<DecisionScores, ReviewError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("decide|{claim}|{passage}"));
+        Ok(self.scores)
+    }
+}
+
 /// The NLI files and the language model files of one load.
 type LoadedFiles = (Vec<PathBuf>, Vec<PathBuf>);
 
@@ -118,6 +158,8 @@ pub struct FakeReviewBackend {
     pub nli: FakeNli,
     /// When true, the load fails as with damaged model files.
     pub fail: bool,
+    /// [`FakeDecider::contradicts`] by default.
+    pub decider: FakeDecider,
     pub loaded: Arc<Mutex<Option<LoadedFiles>>>,
     /// The number of loads.
     pub loads: Arc<AtomicUsize>,
@@ -132,6 +174,7 @@ impl FakeReviewBackend {
             llm,
             nli,
             fail: false,
+            decider: FakeDecider::contradicts(),
             loaded: Arc::default(),
             loads: Arc::default(),
             copies: Arc::default(),
@@ -154,6 +197,7 @@ impl ReviewBackend for FakeReviewBackend {
         Ok(Engines {
             llm: Box::new(llm),
             nli: Box::new(self.nli.clone()),
+            decider: Box::new(self.decider.clone()),
         })
     }
 }

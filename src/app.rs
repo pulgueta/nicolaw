@@ -2805,6 +2805,8 @@ mod tests {
                 nli_contradiction: 0.7,
                 explanation: None,
                 segment_revision: 0,
+                decision: None,
+                decision_p: None,
             })
             .unwrap()
             .id as u64;
@@ -2897,6 +2899,8 @@ mod tests {
                 nli_contradiction: 0.7,
                 explanation: None,
                 segment_revision: 0,
+                decision: None,
+                decision_p: None,
             })
             .unwrap()
             .id as u64;

@@ -4661,6 +4661,8 @@ mod tests {
             nli_contradiction: 0.95,
             explanation: Some("El registro ubica al acusado en Bogotá.".into()),
             segment_revision: 0,
+            decision: None,
+            decision_p: None,
         }
     }
 

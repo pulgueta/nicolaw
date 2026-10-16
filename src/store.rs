@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::extract::chunk::chunk;
 use crate::extract::{Page, PageSource};
+use crate::review::Decision;
 
 /// The largest file that the store accepts: 100 MB.
 pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
@@ -20,9 +21,10 @@ pub const BLOCK_SIZE: usize = 256 * 1024;
 
 /// Version 1 had one `files` table. Version 2 has cases, evidence, pages, chunks, and search.
 /// Version 3 adds hearings and their transcript segments. Version 4 adds the suggestions of
-/// the analysis. No release has version 3 yet, so its segment columns can still grow:
-/// [`Store::migrate`] adds the new columns to a database that a development build made.
-const SCHEMA_VERSION: i64 = 4;
+/// the analysis. Version 5 adds the decision step to the suggestions. No release has version 3
+/// yet, so its segment columns can still grow: [`Store::migrate`] adds the new columns to a
+/// database that a development build made.
+const SCHEMA_VERSION: i64 = 5;
 /// A question is the context of a statement only when it ends at most this long before it.
 pub const QUESTION_MAX_GAP_MS: i64 = 90_000;
 
@@ -142,6 +144,11 @@ const ANALYSIS_STATES: &str = "
         state      TEXT    NOT NULL CHECK (state IN
             ('waiting', 'complete', 'no_claim', 'no_source', 'failed', 'skipped'))
     );
+";
+
+const SCHEMA_V5: &str = "
+    ALTER TABLE suggestions ADD COLUMN decision TEXT;
+    ALTER TABLE suggestions ADD COLUMN decision_p REAL;
 ";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -384,6 +391,10 @@ pub struct NewSuggestion {
     pub explanation: Option<String>,
     /// The revision of the segment text that the analysis read.
     pub segment_revision: i64,
+    /// The best option of the decision step, if it ran.
+    pub decision: Option<Decision>,
+    /// The probability of `decision`, from 0 to 1.
+    pub decision_p: Option<f64>,
 }
 
 /// A stored suggestion, with the source of its evidence passage.
@@ -405,6 +416,8 @@ pub struct Suggestion {
     pub level: SuggestionLevel,
     pub nli_contradiction: f64,
     pub explanation: Option<String>,
+    pub decision: Option<Decision>,
+    pub decision_p: Option<f64>,
     pub status: SuggestionStatus,
     pub segment_revision: i64,
 }
@@ -503,7 +516,8 @@ const SELECT_EVIDENCE: &str = "SELECT e.id, e.name, e.mime, e.size, e.sha256, \
 
 const SELECT_SUGGESTION: &str = "SELECT s.id, s.hearing_id, s.segment_id, s.chunk_id, \
      c.evidence_id, e.name, c.page, s.claim, s.claim_quote, s.evidence_quote, s.kind, s.level, \
-     s.nli_contradiction, s.explanation, s.status, s.segment_revision, e.mime \
+     s.nli_contradiction, s.explanation, s.status, s.segment_revision, e.mime, s.decision, \
+     s.decision_p \
      FROM suggestions s JOIN chunks c ON c.id = s.chunk_id JOIN evidence e ON e.id = c.evidence_id";
 
 const SELECT_SEGMENT: &str =
@@ -542,7 +556,10 @@ impl Store {
             if version < 3 {
                 tx.execute_batch(SCHEMA_V3)?;
             }
-            tx.execute_batch(SCHEMA_V4)?;
+            if version < 4 {
+                tx.execute_batch(SCHEMA_V4)?;
+            }
+            tx.execute_batch(SCHEMA_V5)?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
         }
@@ -1148,8 +1165,8 @@ impl Store {
         self.conn.execute(
             "INSERT INTO suggestions (hearing_id, segment_id, chunk_id, claim, evidence_quote,
                  claim_quote, kind, level, nli_contradiction, explanation, created_at,
-                 segment_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch(), ?11)",
+                 segment_revision, decision, decision_p)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch(), ?11, ?12, ?13)",
             params![
                 new.hearing_id,
                 new.segment_id,
@@ -1162,6 +1179,8 @@ impl Store {
                 new.nli_contradiction,
                 new.explanation,
                 new.segment_revision,
+                new.decision.map(Decision::as_str),
+                new.decision_p,
             ],
         )?;
         self.conn.query_row(
@@ -1450,6 +1469,11 @@ fn row_to_suggestion(row: &rusqlite::Row) -> rusqlite::Result<Suggestion> {
         status: SuggestionStatus::parse(&row.get::<_, String>(14)?),
         segment_revision: row.get(15)?,
         evidence_mime: row.get(16)?,
+        decision: row
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(Decision::parse),
+        decision_p: row.get(18)?,
     })
 }
 
@@ -1491,6 +1515,7 @@ mod tests {
         SuggestionStatus, locator_label,
     };
     use crate::extract::{Page, PageSource};
+    use crate::review::Decision;
 
     /// A new file in its own folder, so that tests that run at the same time do not change the
     /// file of an other test during an import.
@@ -1935,7 +1960,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(old_table, 0);
     }
 
@@ -2054,6 +2079,47 @@ mod tests {
 
         assert_eq!(store.hearings(1).unwrap()[0].title, "Audiencia");
         assert!(store.suggestions(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_version_4_database_keeps_its_suggestions_without_a_decision() {
+        let dir = std::env::temp_dir().join(format!("nicolaw-v4-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v4.db");
+        let _ = fs::remove_file(&db);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(super::SCHEMA_V2).unwrap();
+        conn.execute_batch(super::SCHEMA_V3).unwrap();
+        conn.execute_batch(super::SCHEMA_V4).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 4;
+             INSERT INTO cases VALUES (1, 'Caso', 0);
+             INSERT INTO evidence (id, case_id, name, mime, size, sha256, added_at, content)
+             VALUES (1, 1, 'acta.txt', 'text/plain', 1, '', 0, x'41');
+             INSERT INTO chunks (id, evidence_id, page, idx, text)
+             VALUES (1, 1, 1, 0, 'El acusado estaba en Bogotá.');
+             INSERT INTO hearings (id, case_id, title) VALUES (1, 1, 'Audiencia');
+             INSERT INTO segments (id, hearing_id, t_start_ms, t_end_ms, text, speaker, final)
+             VALUES (1, 1, 0, 1000, 'Yo estaba en Medellín.', 'accused', 1);
+             INSERT INTO suggestions (hearing_id, segment_id, chunk_id, claim, evidence_quote,
+                 level, nli_contradiction, created_at)
+             VALUES (1, 1, 1, 'El acusado estaba en Medellín.', 'en Bogotá', 'check', 0.7, 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        let suggestions = store.suggestions(1).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].claim, "El acusado estaba en Medellín.");
+        assert_eq!(suggestions[0].decision, None);
+        assert_eq!(suggestions[0].decision_p, None);
+        let version: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -2320,6 +2386,8 @@ mod tests {
             nli_contradiction: 0.93,
             explanation: Some("La prueba ubica la declaración en Bogotá.".into()),
             segment_revision: 0,
+            decision: Some(Decision::Contradicts),
+            decision_p: Some(0.875),
         }
     }
 
@@ -2616,6 +2684,8 @@ mod tests {
             stored.explanation.as_deref(),
             Some("La prueba ubica la declaración en Bogotá.")
         );
+        assert_eq!(stored.decision, Some(Decision::Contradicts));
+        assert_eq!(stored.decision_p, Some(0.875));
         assert_eq!(stored.status, SuggestionStatus::Open);
         assert_eq!(store.suggestions(hearing).unwrap()[0].id, stored.id);
     }
@@ -2627,12 +2697,16 @@ mod tests {
         new.claim_quote = None;
         new.kind = None;
         new.explanation = None;
+        new.decision = None;
+        new.decision_p = None;
 
         let stored = store.insert_suggestion(&new).unwrap();
 
         assert_eq!(stored.claim_quote, None);
         assert_eq!(stored.kind, None);
         assert_eq!(stored.explanation, None);
+        assert_eq!(stored.decision, None);
+        assert_eq!(stored.decision_p, None);
         assert_eq!(stored.level, SuggestionLevel::Check);
     }
 

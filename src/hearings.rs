@@ -129,6 +129,9 @@ pub struct HearingsView {
     /// True while the models load and the microphone opens.
     starting: bool,
     live: Option<Live>,
+    /// The recordings that Finalizar ended: each task ends after the last segment, the end of
+    /// the hearing, and the refine pass. The quit hook waits for them.
+    finishing: Vec<Task<()>>,
     /// The mic level, from 0 to 1.
     level: f32,
     /// True while the switch "the accused speaks" is on. The processor reads it at the start of
@@ -170,6 +173,7 @@ impl HearingsView {
             download: None,
             starting: false,
             live: None,
+            finishing: Vec::new(),
             level: 0.0,
             accused: Arc::new(AtomicBool::new(false)),
             message: None,
@@ -650,7 +654,15 @@ impl HearingsView {
                 if self.partial.as_ref().map(|partial| partial.segment_id) == Some(segment.id) {
                     self.partial = None;
                 }
-                self.segments.push(segment);
+                // The list can already have the segment, if it loaded after the segment ended.
+                match self
+                    .segments
+                    .iter_mut()
+                    .find(|shown| shown.id == segment.id)
+                {
+                    Some(shown) => *shown = segment,
+                    None => self.segments.push(segment),
+                }
                 self.transcript_scroll.scroll_to_bottom();
             }
             Event::Discarded { segment_id } => {
@@ -712,20 +724,23 @@ impl HearingsView {
         // The processor input closes when the capture and the sender are gone.
         drop(capture);
         drop(input);
-        // The refine pass can continue after the end. Its text goes to the store.
-        if let Some(refine_task) = refine_task {
-            refine_task.detach();
-        }
         self.level = 0.0;
         cx.notify();
         let store = self.store.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let (ended_sender, ended) = async_channel::bounded(1);
+        self.finishing.push(cx.background_spawn(async move {
             task.await;
-            let ended = cx
-                .background_spawn(async move { store.lock().unwrap().end_hearing(hearing_id) })
-                .await;
+            let result = store.lock().unwrap().end_hearing(hearing_id);
+            ended_sender.try_send(result).ok();
+            // The refine pass can continue after the end. Its text goes to the store.
+            if let Some(refine_task) = refine_task {
+                refine_task.await;
+            }
+        }));
+        cx.spawn_in(window, async move |this, cx| {
+            let ended = ended.recv().await;
             this.update_in(cx, |this, window, cx| {
-                if ended.is_err() {
+                if !matches!(ended, Ok(Ok(_))) {
                     this.show_error(AudioError::Storage, cx);
                 }
                 this.load_hearings(None, window, cx);
@@ -739,30 +754,34 @@ impl HearingsView {
     /// complete, and the models are free before the process exits: a Metal model that is
     /// still loaded at exit makes ggml abort.
     fn stop_at_quit(&mut self, cx: &mut Context<Self>) {
-        let Some(live) = self.live.take() else {
-            return;
-        };
-        let Live {
-            hearing_id,
-            mut capture,
-            input,
-            task,
-            refine_task,
-            ..
-        } = live;
-        capture.stop();
-        drop(capture);
-        drop(input);
+        // A recording that Finalizar ended can still be finishing.
+        let mut tasks = std::mem::take(&mut self.finishing);
+        let mut hearing_id = None;
+        if let Some(live) = self.live.take() {
+            let Live {
+                hearing_id: id,
+                mut capture,
+                input,
+                task,
+                refine_task,
+                ..
+            } = live;
+            capture.stop();
+            drop(capture);
+            drop(input);
+            hearing_id = Some(id);
+            tasks.push(task);
+            tasks.extend(refine_task);
+        }
         let finished = cx
             .foreground_executor()
             .block_with_timeout(QUIT_TIMEOUT, async move {
-                task.await;
-                if let Some(refine_task) = refine_task {
-                    refine_task.await;
+                for task in tasks {
+                    task.await;
                 }
             })
             .is_ok();
-        if finished {
+        if let Some(hearing_id) = hearing_id.filter(|_| finished) {
             self.store.lock().unwrap().end_hearing(hearing_id).ok();
         }
     }
@@ -879,7 +898,7 @@ impl HearingsView {
     }
 
     fn delete(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.live.as_ref().is_some_and(|live| live.hearing_id == id) {
+        if self.starting || self.live.as_ref().is_some_and(|live| live.hearing_id == id) {
             return;
         }
         let store = self.store.clone();
@@ -1009,7 +1028,7 @@ impl HearingsView {
                         .outline()
                         .danger()
                         .label("Eliminar")
-                        .disabled(is_live)
+                        .disabled(is_live || self.starting)
                         .on_click(
                             cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
                         ),
@@ -1344,9 +1363,10 @@ mod tests {
 
     use super::{HearingsEnv, HearingsView, format_time, speaker_label};
     use crate::audio::fake::FakeBackend;
+    use crate::audio::pipeline::Event;
     use crate::audio::{AudioError, ModelPaths};
     use crate::models::{ModelDirs, NEMOTRON, SILERO_VAD};
-    use crate::store::{Speaker, Store};
+    use crate::store::{Segment, Speaker, Store};
 
     const WAIT: Duration = Duration::from_secs(1);
 
@@ -1678,5 +1698,101 @@ mod tests {
             assert!(view.hearings.is_empty());
             assert_eq!(view.selected, None);
         });
+    }
+
+    #[gpui_kit::test]
+    async fn a_hearing_cannot_be_deleted_while_a_recording_starts(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let id = store.create_hearing(case, "Audiencia").unwrap().id;
+        let backend = FakeBackend::new("");
+        let dirs = model_dirs("delete-starting", true);
+        let (window, view) = open("delete-starting", store, case, &backend, &dirs, cx);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", id as u64)).is_some()
+        })
+        .await;
+        click(cx, window, ("hearing", id as u64));
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("delete-hearing").is_some()
+        })
+        .await;
+
+        view.update(cx, |view, cx| {
+            view.starting = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        click(cx, window, "delete-hearing");
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.try_find("ok").is_none());
+            view.update(cx, |view, cx| view.delete(id, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.hearings.len(), 1);
+            assert_eq!(view.store.lock().unwrap().hearings(case).unwrap().len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn quit_after_finish_waits_for_the_end_of_the_hearing(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let id = store.create_hearing(case, "Audiencia").unwrap().id;
+        let backend = FakeBackend::new("Fin.");
+        let dirs = model_dirs("quit-finish", true);
+        let (window, view) = open("quit-finish", store, case, &backend, &dirs, cx);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", id as u64)).is_some()
+        })
+        .await;
+        click(cx, window, ("hearing", id as u64));
+        wait_until_ready(cx, window, &view).await;
+        click(cx, window, "start");
+        cx.wait_for(window, WAIT, |_, _| backend.input.lock().unwrap().is_some())
+            .await;
+        backend.send(0.5, 5);
+
+        click(cx, window, "finish");
+        view.update(cx, |view, cx| view.stop_at_quit(cx));
+
+        cx.update(|cx| {
+            let store = view.read(cx).store.lock().unwrap();
+            assert!(store.hearings(case).unwrap()[0].ended_at.is_some());
+            assert_eq!(store.segments(id).unwrap()[0].text, "Fin.");
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn a_final_segment_that_is_already_shown_is_not_shown_twice(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let id = store.create_hearing(case, "Audiencia").unwrap().id;
+        let backend = FakeBackend::new("");
+        let dirs = model_dirs("final-twice", true);
+        let (window, view) = open("final-twice", store, case, &backend, &dirs, cx);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", id as u64)).is_some()
+        })
+        .await;
+        click(cx, window, ("hearing", id as u64));
+        cx.run_until_parked();
+        let segment = Segment {
+            id: 7,
+            t_start_ms: 0,
+            t_end_ms: 320,
+            text: "Sí.".into(),
+            speaker: Speaker::Other,
+            is_final: true,
+        };
+
+        view.update(cx, |view, cx| {
+            view.segments = vec![segment.clone()];
+            view.apply(id, Event::Final(segment.clone()), cx);
+        });
+
+        cx.update(|cx| assert_eq!(view.read(cx).segments, [segment]));
     }
 }

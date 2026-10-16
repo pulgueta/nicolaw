@@ -43,7 +43,7 @@ The user asked for Jev (TypeSafe AI) as the classifier. Jev is proprietary and A
 - [x] T1 `Decision` trait, `DecisionScores`, fake, `decide_with` rule (NLI level + decision), thresholds, store schema v5 (`decision TEXT`, `decision_p REAL` on `suggestions`), analyzer cascade. Route: delegated writer (opus).
 - [x] T2 Native option-logit scoring on the loaded Qwen3 in `src/review/native.rs` (shared model thread), prompt in `src/review/prompt.rs`, ignored real-model test. Same writer.
 - [x] T3 Panel shows the decision label and probability in Spanish; README "Analysis" section updated with the Jev comparison summary. Same writer.
-- [ ] T4 Spot check, `gh stack submit --auto --open`, `cargo clean`, PR body with research summary. Route: inline.
+- [x] T4 Spot check, `gh stack submit --auto --open`, `cargo clean`, PR body with research summary. Route: inline.
 
 ## Progress and evidence
 
@@ -54,3 +54,6 @@ The user asked for Jev (TypeSafe AI) as the classifier. Jev is proprietary and A
 - T3 done: `9b15dc8 feat(app): show decision in suggestions panel`. Spanish `Tag` under the level row (`Contradice · 92 %`, `Compatible`, `No relacionada`, `Insuficiente`), nothing when NULL; README "Analysis" with step 4 and "Why not Jev". RED observed for the label test and the view test; then GREEN.
 - Checks after T3: `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0; `cargo test` 163 passed, 0 failed, 8 ignored; `cargo build` exit 0.
 - Next step: T4 (parent): spot check, `gh stack submit --auto --open`, `cargo clean`, PR body.
+- T4: PR #5 https://github.com/pulgueta/nicolaw/pull/5 (base `analysis`), ready for review. Parent spot check on `classification`: `cargo test` 163 passed, 8 ignored before the review fixes; 182 passed, 8 ignored after the stack rebase with the Codex fixes. `cargo clean` ran twice.
+- Review fixes (2026-10-15): 16 Codex findings fixed bottom-up on `foundation` (4eb98a1, b4b0899, a33742c, f16e777, 1b90807), `transcription` (104689d, 7568cad, ebdc9de), `analysis` (f2b7675, fe56208); stack rebased with `--no-trunk`, pushed, and each comment answered.
+- Open: `pipeline::refine()` skips `finish()` on a feed error (same shape as finding 6). `DECISION_MIN` needs calibration data.

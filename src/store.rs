@@ -126,6 +126,13 @@ pub struct Evidence {
     pub pages: u32,
 }
 
+impl Evidence {
+    /// The location of a page of this file, for the user: "Página n" or "Sección n".
+    pub fn locator_label(&self, page: u32) -> String {
+        locator_label(&self.mime, page)
+    }
+}
+
 /// One search result: a chunk of evidence text that matches the query.
 #[derive(Clone, Debug)]
 pub struct SearchHit {
@@ -548,9 +555,19 @@ fn fts_query(query: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
-/// The location of a page in an evidence file, for the user.
-pub fn locator_label(_mime: &str, page: u32) -> String {
-    format!("Página {page}")
+/// True if the stored pages of a file of this type are physical pages: a PDF or an image. A DOCX
+/// or text file is stored as text sections, not as printed pages.
+pub fn has_physical_pages(mime: &str) -> bool {
+    mime == "application/pdf" || mime.starts_with("image/")
+}
+
+/// The location of a page in an evidence file, for the user: "Página n" or "Sección n".
+pub fn locator_label(mime: &str, page: u32) -> String {
+    if has_physical_pages(mime) {
+        format!("Página {page}")
+    } else {
+        format!("Sección {page}")
+    }
 }
 
 /// The last part of `path`, used as the display name of the file.
@@ -582,7 +599,7 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use super::{AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, Store};
+    use super::{AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, Store, locator_label};
     use crate::extract::{Page, PageSource};
 
     /// A new file in its own folder, so that tests that run at the same time do not change the
@@ -879,6 +896,21 @@ mod tests {
             assert!(groups[0].hits[0].rank <= group.hits[0].rank);
         }
         assert!(store.search_groups(case, "", 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pdf_and_image_locators_are_pages_and_other_locators_are_sections() {
+        let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        assert_eq!(locator_label("application/pdf", 3), "Página 3");
+        assert_eq!(locator_label("image/png", 1), "Página 1");
+        assert_eq!(locator_label("image/jpeg", 1), "Página 1");
+        assert_eq!(locator_label(docx, 1), "Sección 1");
+        assert_eq!(locator_label("text/plain", 2), "Sección 2");
+        assert_eq!(locator_label("application/octet-stream", 1), "Sección 1");
+
+        let (store, case) = store_with_case();
+        let id = import(&store, case, &temp_file("acta.docx", b"x"));
+        assert_eq!(store.evidence(id).unwrap().locator_label(1), "Sección 1");
     }
 
     #[test]

@@ -38,7 +38,7 @@ use crate::extract::{Page, PageSource};
 use crate::preview::{self, Preview};
 use crate::store::{
     AnalysisStatus, Case, Evidence, ImportError, SearchGroup, SearchHit, Store, file_name,
-    locator_label,
+    has_physical_pages, locator_label,
 };
 use crate::transfer::{Queue, State};
 
@@ -1204,7 +1204,15 @@ impl FilesView {
                 .item("SHA-256", format!("{sha256}…"), 1)
                 .item("Agregado", file.added_at.clone(), 1)
                 .item("Estado", status_label(file.status), 1)
-                .item("Páginas", pages, 1),
+                .item(
+                    if has_physical_pages(&file.mime) {
+                        "Páginas"
+                    } else {
+                        "Secciones"
+                    },
+                    pages,
+                    1,
+                ),
         )
         .child(
             TabBar::new("detail-tabs")
@@ -1338,41 +1346,44 @@ impl FilesView {
                 .children(note.map(|note| div().text_xs().child(note)))
         };
 
-        let frame = match (file.status, &self.pages) {
-            (AnalysisStatus::Pending | AnalysisStatus::Analyzing, _) => message(
-                frame,
-                "El análisis no terminó. El texto aparece aquí cuando termine.",
-                None,
-            ),
-            (AnalysisStatus::NotAnalyzed, _) => message(
-                frame,
-                "Este archivo no tiene texto para mostrar.",
-                file.note.clone(),
-            ),
-            (AnalysisStatus::Ready, None) => frame,
-            (AnalysisStatus::Ready, Some(pages))
-                if pages.iter().all(|page| page.text.trim().is_empty()) =>
-            {
-                message(frame, "Nicolaw no encontró texto en este archivo.", None)
-            }
-            (AnalysisStatus::Ready, Some(pages)) => frame
-                .child(
-                    v_flex()
-                        .id("text-pages")
-                        .size_full()
-                        .track_scroll(&self.text_scroll)
-                        .overflow_y_scroll()
-                        .p_3()
-                        .gap_4()
-                        .children(pages.iter().map(|page| render_page(page, muted))),
-                )
-                .vertical_scrollbar(&self.text_scroll),
-        };
+        let frame =
+            match (file.status, &self.pages) {
+                (AnalysisStatus::Pending | AnalysisStatus::Analyzing, _) => message(
+                    frame,
+                    "El análisis no terminó. El texto aparece aquí cuando termine.",
+                    None,
+                ),
+                (AnalysisStatus::NotAnalyzed, _) => message(
+                    frame,
+                    "Este archivo no tiene texto para mostrar.",
+                    file.note.clone(),
+                ),
+                (AnalysisStatus::Ready, None) => frame,
+                (AnalysisStatus::Ready, Some(pages))
+                    if pages.iter().all(|page| page.text.trim().is_empty()) =>
+                {
+                    message(frame, "Nicolaw no encontró texto en este archivo.", None)
+                }
+                (AnalysisStatus::Ready, Some(pages)) => frame
+                    .child(
+                        v_flex()
+                            .id("text-pages")
+                            .size_full()
+                            .track_scroll(&self.text_scroll)
+                            .overflow_y_scroll()
+                            .p_3()
+                            .gap_4()
+                            .children(pages.iter().map(|page| {
+                                render_page(page, file.locator_label(page.number), muted)
+                            })),
+                    )
+                    .vertical_scrollbar(&self.text_scroll),
+            };
         frame.test_support()
     }
 }
 
-fn render_page(page: &Page, muted: Hsla) -> impl IntoElement {
+fn render_page(page: &Page, locator: String, muted: Hsla) -> impl IntoElement {
     let text = page.text.trim();
     v_flex()
         .gap_2()
@@ -1381,12 +1392,7 @@ fn render_page(page: &Page, muted: Hsla) -> impl IntoElement {
                 .id(("page", page.number as u64))
                 .gap_2()
                 .items_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .child(format!("Página {}", page.number)),
-                )
+                .child(div().text_sm().font_semibold().child(locator))
                 .when(page.source == PageSource::Ocr, |header| {
                     header.child(Tag::info().small().child("OCR"))
                 })

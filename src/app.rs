@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
@@ -73,18 +73,27 @@ enum Tab {
     Text,
 }
 
+/// Why the new case dialog did not create the case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NameNote {
+    Empty,
+    /// A case with this name exists. The next submit of the same name creates the case.
+    Duplicate(String),
+}
+
 /// One case in the case select.
 #[derive(Clone)]
 struct CaseItem {
     id: i64,
-    name: SharedString,
+    /// The name and the id, so that two cases with the same name look different.
+    title: SharedString,
 }
 
 impl SelectItem for CaseItem {
     type Value = i64;
 
     fn title(&self) -> SharedString {
-        self.name.clone()
+        self.title.clone()
     }
 
     fn value(&self) -> &i64 {
@@ -243,7 +252,7 @@ impl FilesView {
             .iter()
             .map(|case| CaseItem {
                 id: case.id,
-                name: case.name.clone().into(),
+                title: case_title(case).into(),
             })
             .collect();
         self.cases = cases;
@@ -292,12 +301,33 @@ impl FilesView {
     fn open_new_case_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Nombre del caso"));
         let view = cx.entity().downgrade();
-        // Returns false if the name is empty, so that the dialog stays open.
+        // The message under the field, after a submit that did not create the case.
+        let note: Rc<RefCell<Option<NameNote>>> = Rc::default();
+        // Returns false if the dialog must stay open: the name is empty, or it is a duplicate
+        // that the user did not see a warning for yet.
         let submit = Rc::new({
             let input = input.clone();
+            let note = note.clone();
             move |window: &mut Window, cx: &mut App| {
                 let name = input.read(cx).value().trim().to_owned();
-                if name.is_empty() {
+                let duplicate = view.upgrade().is_some_and(|view| {
+                    let key = name.to_lowercase();
+                    view.read(cx)
+                        .cases
+                        .iter()
+                        .any(|case| case.name.trim().to_lowercase() == key)
+                });
+                let next = if name.is_empty() {
+                    Some(NameNote::Empty)
+                } else if duplicate && *note.borrow() != Some(NameNote::Duplicate(name.clone())) {
+                    Some(NameNote::Duplicate(name.clone()))
+                } else {
+                    None
+                };
+                if next.is_some() {
+                    *note.borrow_mut() = next;
+                    input.focus_handle(cx).focus(window, cx);
+                    window.refresh();
                     return false;
                 }
                 view.update(cx, |this, cx| this.create_case(name, window, cx))
@@ -312,14 +342,48 @@ impl FilesView {
             }
             let on_click = submit.clone();
             let on_ok = submit.clone();
+            let message = match &*note.borrow() {
+                None => None,
+                Some(NameNote::Empty) => Some(
+                    div()
+                        .id("case-name-error")
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child("Escriba el nombre del caso.")
+                        .test_support(),
+                ),
+                Some(NameNote::Duplicate(_)) => Some(
+                    h_flex()
+                        .id("case-name-warning")
+                        .gap_2()
+                        .items_start()
+                        .text_sm()
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .text_color(cx.theme().warning)
+                                .flex_none()
+                                .mt_0p5(),
+                        )
+                        .child(
+                            "Ya existe un caso con este nombre. Use un nombre que permita \
+                             distinguirlo.",
+                        )
+                        .test_support(),
+                ),
+            };
             dialog
                 .title("Nuevo caso")
                 .w(px(420.))
                 .child(
-                    div()
-                        .id("case-name")
-                        .child(Input::new(&input))
-                        .test_support(),
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("case-name")
+                                .child(Input::new(&input))
+                                .test_support(),
+                        )
+                        .children(message),
                 )
                 .footer(
                     DialogFooter::new()
@@ -1486,6 +1550,11 @@ fn file_name_label(id: impl Into<ElementId>, name: &str) -> Stateful<Div> {
         .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
 }
 
+/// The title of a case in the case select, for example "Interbolsa · Caso 1".
+fn case_title(case: &Case) -> String {
+    format!("{} · Caso {}", case.name, case.id)
+}
+
 fn files_with_hits(count: usize) -> String {
     match count {
         1 => "1 archivo con coincidencias".to_owned(),
@@ -1613,7 +1682,9 @@ mod tests {
         WindowOptions, px, size,
     };
 
-    use super::{FilesView, Loaded, Tab, remove_open_copies, remove_open_copy, write_open_copy};
+    use super::{
+        FilesView, Loaded, Tab, case_title, remove_open_copies, remove_open_copy, write_open_copy,
+    };
     use crate::extract::{Page, PageSource};
     use crate::store::{AnalysisStatus, Store};
 
@@ -1694,6 +1765,113 @@ mod tests {
             window.try_find("case-name").is_none() && window.try_find("empty-state").is_some()
         })
         .await;
+    }
+
+    /// Opens the new case dialog and waits until its slide-in ends.
+    async fn open_case_dialog(window: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(window, |_, window, cx| window.click("new-case", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("case-name").is_some()
+        })
+        .await;
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    async fn an_empty_or_blank_case_name_shows_a_field_error(cx: &mut TestAppContext) {
+        let (window, view) = open(Store::open_in_memory().unwrap(), cx);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("no-cases").is_some()
+        })
+        .await;
+
+        for (text, by_return) in [("", false), ("   ", false), ("", true), ("   ", true)] {
+            open_case_dialog(window, cx).await;
+            cx.update_window(window, |_, window, cx| {
+                window.click("case-name", cx);
+                if !text.is_empty() {
+                    window.input(text, cx);
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| {
+                if by_return {
+                    window.press("enter", cx);
+                } else {
+                    window.click("create-case", cx);
+                }
+            })
+            .unwrap();
+            cx.wait_for(window, WAIT, |window, _| {
+                window.try_find("case-name-error").is_some()
+            })
+            .await;
+
+            cx.update_window(window, |_, window, _| {
+                assert!(window.find("case-name").visible(), "{text:?} {by_return}");
+            })
+            .unwrap();
+            cx.update(|cx| {
+                assert!(
+                    view.read(cx)
+                        .store
+                        .lock()
+                        .unwrap()
+                        .cases()
+                        .unwrap()
+                        .is_empty()
+                );
+            });
+            cx.update_window(window, |_, window, cx| window.press("escape", cx))
+                .unwrap();
+            cx.wait_for(window, WAIT, |window, _| {
+                window.try_find("case-name").is_none()
+            })
+            .await;
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn a_duplicate_case_name_is_created_after_one_warning(cx: &mut TestAppContext) {
+        let (store, first) = store_with_case();
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+
+        open_case_dialog(window, cx).await;
+        cx.update_window(window, |_, window, cx| {
+            window.click("case-name", cx);
+            window.input(" caso de prueba ", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.click("create-case", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("case-name-warning").is_some()
+        })
+        .await;
+        cx.update(|cx| assert_eq!(view.read(cx).cases.len(), 1));
+
+        cx.update_window(window, |_, window, cx| window.click("create-case", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).cases.len() == 2)
+            .await;
+
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let second = view.cases.iter().find(|case| case.id != first).unwrap();
+            assert_eq!(second.name, "caso de prueba");
+            assert_eq!(view.case_id, Some(second.id));
+            assert_ne!(case_title(&view.cases[0]), case_title(&view.cases[1]));
+            assert_eq!(
+                case_title(second),
+                format!("caso de prueba · Caso {}", second.id)
+            );
+        });
     }
 
     #[gpui_kit::test]

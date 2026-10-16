@@ -186,6 +186,18 @@ impl DecisionScores {
 /// The level after the decision step. A conflict stays a conflict only when the decision is
 /// [`Decision::Contradicts`] at or above [`DECISION_MIN`]. Else it is a check.
 pub fn confirm(level: SuggestionLevel, scores: DecisionScores) -> SuggestionLevel {
+    // A score that is not a finite number means a failed model call: it gives no conflict.
+    let finite = [
+        scores.contradicts,
+        scores.consistent,
+        scores.unrelated,
+        scores.insufficient,
+    ]
+    .iter()
+    .all(|score| score.is_finite());
+    if !finite {
+        return SuggestionLevel::Check;
+    }
     match (level, scores.best()) {
         (SuggestionLevel::Conflict, (Decision::Contradicts, p)) if p >= DECISION_MIN => {
             SuggestionLevel::Conflict
@@ -228,7 +240,7 @@ pub fn decide(scores: NliScores) -> Option<SuggestionLevel> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, DecisionScores, NliScores, confirm, decide};
+    use super::{DECISION_MIN, Decision, DecisionScores, NliScores, confirm, decide};
     use crate::store::SuggestionLevel;
 
     fn decision(contradicts: f32, consistent: f32, unrelated: f32) -> DecisionScores {
@@ -281,6 +293,47 @@ mod tests {
             confirm(SuggestionLevel::Conflict, decision(0.1, 0.8, 0.05)),
             SuggestionLevel::Check
         );
+    }
+
+    #[test]
+    fn the_decision_minimum_is_the_edge_of_a_conflict() {
+        let at = decision(DECISION_MIN, 0.2, 0.1);
+        let below = decision(DECISION_MIN.next_down(), 0.2, 0.1);
+
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, at),
+            SuggestionLevel::Conflict
+        );
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, below),
+            SuggestionLevel::Check
+        );
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, decision(1.0, 0.0, 0.0)),
+            SuggestionLevel::Conflict
+        );
+    }
+
+    #[test]
+    fn scores_that_are_not_finite_never_give_a_conflict() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let in_contradicts = DecisionScores {
+                contradicts: bad,
+                ..decision(0.9, 0.05, 0.05)
+            };
+            let in_other = DecisionScores {
+                consistent: bad,
+                ..decision(0.9, 0.05, 0.05)
+            };
+
+            for scores in [in_contradicts, in_other] {
+                assert_eq!(
+                    confirm(SuggestionLevel::Conflict, scores),
+                    SuggestionLevel::Check,
+                    "{scores:?}"
+                );
+            }
+        }
     }
 
     #[test]

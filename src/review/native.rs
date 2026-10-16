@@ -512,15 +512,17 @@ mod tests {
         );
     }
 
-    /// Scores the decision options of a clear Spanish contradiction, and of a consistent and an
-    /// unrelated pair for comparison, with the installed language model:
+    /// Scores the decision options of a Spanish contradiction, a consistent pair, an unrelated
+    /// pair, and a pair with too little information, with the installed language model. Each
+    /// pair must get its label, and the four scores must be finite and sum to 1. This is a
+    /// check of four examples, not a calibration (see `real_calibration_pairs_report`):
     ///
     /// ```sh
     /// cargo test real_decider -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "needs the installed language model"]
-    fn real_decider_marks_a_spanish_contradiction() {
+    fn real_decider_labels_spanish_pairs() {
         use crate::review::Decision;
         use crate::review::prompt::decision_prompt;
 
@@ -528,32 +530,48 @@ mod tests {
         let claim = "El acusado estaba en Bogotá el 12 de marzo de 2024.";
         let pairs = [
             (
-                "contradiction",
+                Decision::Contradicts,
                 "Según el registro del hotel, el 12 de marzo de 2024 el acusado estaba en \
                  Medellín y no estuvo en Bogotá.",
             ),
             (
-                "consistent",
+                Decision::Consistent,
                 "El 12 de marzo de 2024 el acusado almorzó en un restaurante de Bogotá.",
             ),
             (
-                "unrelated",
+                Decision::Unrelated,
                 "El testigo vio un carro rojo frente a la casa.",
             ),
+            (
+                Decision::Insufficient,
+                "El acusado llegó a Bogotá en marzo de 2024, pero el registro no dice el \
+                 día.",
+            ),
         ];
-        let mut scores = Vec::new();
-        for (name, passage) in pairs {
+        let mut labels = Vec::new();
+        for (expected, passage) in pairs {
             let started = std::time::Instant::now();
             let decision = model.decide(&decision_prompt(claim, passage)).unwrap();
             println!(
-                "{name} ({:?}): {decision:?} best={:?}",
+                "{expected:?} ({:?}): {decision:?} best={:?}",
                 started.elapsed(),
                 decision.best()
             );
-            scores.push(decision);
+            let all = [
+                decision.contradicts,
+                decision.consistent,
+                decision.unrelated,
+                decision.insufficient,
+            ];
+            assert!(all.iter().all(|p| p.is_finite()), "{decision:?}");
+            let sum: f32 = all.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-3, "sum {sum}");
+            labels.push((expected, decision.best().0));
         }
 
-        assert_eq!(scores[0].best().0, Decision::Contradicts);
+        for (expected, best) in labels {
+            assert_eq!(best, expected);
+        }
     }
 
     /// Runs the full analysis with the real models: a hearing answer of the accused against a

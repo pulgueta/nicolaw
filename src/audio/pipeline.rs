@@ -307,6 +307,8 @@ impl Processor {
             text,
             speaker: current.speaker,
             is_final: true,
+            revision: 0,
+            failed: false,
         }));
     }
 }

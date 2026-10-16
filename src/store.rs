@@ -15,7 +15,9 @@ pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 pub const BLOCK_SIZE: usize = 256 * 1024;
 
 /// Version 1 had one `files` table. Version 2 has cases, evidence, pages, chunks, and search.
-/// Version 3 adds hearings and their transcript segments.
+/// Version 3 adds hearings and their transcript segments. No release has version 3 yet, so its
+/// segment columns can still grow: [`Store::migrate`] adds the new columns to a version 3
+/// database that a development build made.
 const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V2: &str = "
@@ -93,7 +95,10 @@ const SCHEMA_V3: &str = "
         t_end_ms   INTEGER NOT NULL,
         text       TEXT    NOT NULL,
         speaker    TEXT    NOT NULL CHECK (speaker IN ('accused', 'other')),
-        final      INTEGER NOT NULL DEFAULT 0
+        final      INTEGER NOT NULL DEFAULT 0,
+        live_text  TEXT,    -- The live text, after a refined text replaced it
+        revision   INTEGER NOT NULL DEFAULT 0, -- Grows by 1 at each change of the text
+        failed     INTEGER NOT NULL DEFAULT 0  -- 1: the speech in this time range has no text
     );
     CREATE INDEX segments_hearing ON segments(hearing_id);
 ";
@@ -177,6 +182,11 @@ pub struct Segment {
     pub speaker: Speaker,
     /// False while the speech continues and the text can change.
     pub is_final: bool,
+    /// Grows by 1 at each change of the text, for example after the refine pass.
+    pub revision: i64,
+    /// True when the transcription of this speech failed: the segment has no text, but it keeps
+    /// its time range, so that the transcript shows the gap.
+    pub failed: bool,
 }
 
 /// One evidence file, without its content.
@@ -269,6 +279,12 @@ impl Store {
         Self::migrate(Connection::open_in_memory()?)
     }
 
+    /// Runs SQL on the database, so that a test can make a later write fail.
+    #[cfg(test)]
+    pub fn execute_test_sql(&self, sql: &str) -> rusqlite::Result<()> {
+        self.conn.execute_batch(sql)
+    }
+
     fn migrate(mut conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -282,6 +298,7 @@ impl Store {
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
         }
+        add_segment_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -658,11 +675,23 @@ impl Store {
     }
 
     pub fn end_hearing(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE hearings SET ended_at = unixepoch() WHERE id = ?1",
             [id],
         )?;
+        if changed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
+    }
+
+    /// Returns the id and the name of the case of a hearing.
+    pub fn hearing_case(&self, hearing_id: i64) -> rusqlite::Result<(i64, String)> {
+        self.conn.query_row(
+            "SELECT c.id, c.name FROM hearings h JOIN cases c ON c.id = h.case_id WHERE h.id = ?1",
+            [hearing_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
     }
 
     /// Deletes the hearing with its segments, then its audio file.
@@ -703,11 +732,32 @@ impl Store {
         Ok(())
     }
 
-    /// Replaces the text of a segment, for example with a more accurate transcription.
+    /// Replaces the text of a segment, for example with a more accurate transcription. The
+    /// first text stays as the live text, and the revision grows by 1. The same text again
+    /// changes nothing.
     pub fn set_segment_text(&self, id: i64, text: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE segments SET text = ?1 WHERE id = ?2",
+            "UPDATE segments SET live_text = coalesce(live_text, text), text = ?1,
+             revision = revision + 1 WHERE id = ?2 AND text <> ?1",
             params![text, id],
+        )?;
+        Ok(())
+    }
+
+    /// The text of the live transcription, if a later text replaced it.
+    pub fn live_text(&self, id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row(
+            "SELECT live_text FROM segments WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Ends a segment whose transcription failed. It keeps its time range and has no text.
+    pub fn fail_segment(&self, id: i64, t_end_ms: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE segments SET text = '', t_end_ms = ?1, final = 1, failed = 1 WHERE id = ?2",
+            params![t_end_ms, id],
         )?;
         Ok(())
     }
@@ -730,8 +780,8 @@ impl Store {
     pub fn segments(&self, hearing_id: i64) -> rusqlite::Result<Vec<Segment>> {
         self.conn
             .prepare(
-                "SELECT id, t_start_ms, t_end_ms, text, speaker, final FROM segments
-                 WHERE hearing_id = ?1 ORDER BY t_start_ms, id",
+                "SELECT id, t_start_ms, t_end_ms, text, speaker, final, revision, failed
+                 FROM segments WHERE hearing_id = ?1 ORDER BY t_start_ms, id",
             )?
             .query_map([hearing_id], |row| {
                 Ok(Segment {
@@ -741,10 +791,36 @@ impl Store {
                     text: row.get(3)?,
                     speaker: Speaker::parse(&row.get::<_, String>(4)?),
                     is_final: row.get(5)?,
+                    revision: row.get(6)?,
+                    failed: row.get(7)?,
                 })
             })?
             .collect()
     }
+}
+
+/// Adds the segment columns that a version 3 database from an earlier development build does
+/// not have. A database without the `segments` table is not changed.
+fn add_segment_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('segments')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    for (name, definition) in [
+        ("live_text", "TEXT"),
+        ("revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("failed", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE segments ADD COLUMN {name} {definition};"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 fn delete_analysis(conn: &Connection, id: i64) -> rusqlite::Result<()> {
@@ -821,7 +897,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, Speaker, Store, locator_label,
+        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, SCHEMA_V2, Speaker, Store,
+        locator_label,
     };
     use crate::extract::{Page, PageSource};
 
@@ -1420,6 +1497,91 @@ mod tests {
         assert_eq!(segments[1].id, late);
         assert_eq!(segments[1].speaker, Speaker::Accused);
         assert!(!segments[1].is_final);
+    }
+
+    #[test]
+    fn a_refined_text_keeps_the_live_text_and_increments_the_revision() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let id = store.insert_segment(hearing, 0, Speaker::Other).unwrap();
+        store
+            .finish_segment(id, "yo no estaba alli", 2_000)
+            .unwrap();
+        let live = store.segments(hearing).unwrap()[0].revision;
+
+        store.set_segment_text(id, "Yo no estaba allí.").unwrap();
+        store.set_segment_text(id, "Yo no estaba allí.").unwrap();
+        store.set_segment_text(id, "Yo no estaba ahí.").unwrap();
+
+        let segment = &store.segments(hearing).unwrap()[0];
+        assert_eq!(live, 0);
+        assert_eq!(segment.text, "Yo no estaba ahí.");
+        assert_eq!(segment.revision, 2);
+        assert_eq!(
+            store.live_text(id).unwrap().as_deref(),
+            Some("yo no estaba alli")
+        );
+    }
+
+    #[test]
+    fn a_failed_segment_stays_as_a_final_marker_without_text() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let id = store
+            .insert_segment(hearing, 1_000, Speaker::Accused)
+            .unwrap();
+
+        store.fail_segment(id, 4_000).unwrap();
+
+        let segment = &store.segments(hearing).unwrap()[0];
+        assert!(segment.is_final && segment.failed);
+        assert_eq!((segment.t_start_ms, segment.t_end_ms), (1_000, 4_000));
+        assert!(segment.text.is_empty());
+    }
+
+    #[test]
+    fn a_database_from_an_earlier_version_3_gets_the_new_segment_columns() {
+        let path = temp_file("early-v3.db", b"");
+        fs::remove_file(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SCHEMA_V2} CREATE TABLE hearings (id INTEGER PRIMARY KEY, case_id INTEGER \
+                 NOT NULL, title TEXT NOT NULL, started_at INTEGER, ended_at INTEGER, \
+                 audio_path TEXT); CREATE TABLE segments (id INTEGER PRIMARY KEY, hearing_id \
+                 INTEGER NOT NULL, t_start_ms INTEGER NOT NULL, t_end_ms INTEGER NOT NULL, text \
+                 TEXT NOT NULL, speaker TEXT NOT NULL, final INTEGER NOT NULL DEFAULT 0); \
+                 PRAGMA user_version = 3;"
+            ))
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let case = store.create_case("Caso").unwrap().id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let id = store.insert_segment(hearing, 0, Speaker::Other).unwrap();
+        store.fail_segment(id, 10).unwrap();
+
+        assert!(store.segments(hearing).unwrap()[0].failed);
+        assert_eq!(store.segments(hearing).unwrap()[0].revision, 0);
+    }
+
+    #[test]
+    fn the_case_of_a_hearing_has_its_id_and_name() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+
+        assert_eq!(
+            store.hearing_case(hearing).unwrap(),
+            (case, "Caso de prueba".to_owned())
+        );
+    }
+
+    #[test]
+    fn end_hearing_of_a_missing_hearing_is_an_error() {
+        let (store, _) = store_with_case();
+
+        assert!(store.end_hearing(99).is_err());
     }
 
     #[test]

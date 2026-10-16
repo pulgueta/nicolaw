@@ -1786,6 +1786,8 @@ mod tests {
             text: "Sí.".into(),
             speaker: Speaker::Other,
             is_final: true,
+            revision: 0,
+            failed: false,
         };
 
         view.update(cx, |view, cx| {

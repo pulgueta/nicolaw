@@ -22,8 +22,8 @@ Same as `nicolaw-v1-stack`. Fixes keep Spanish UI copy, English code. No new pro
 
 - [x] T1 Release build and tester sessions: Pruebas (cases, import, OCR, search, preview, delete); Audiencias (hearing, models, recording, speaker switch, finalize, transcript); Análisis (switch, model load, suggestions, confirm/dismiss, latency, memory). Route: delegated Codex testers.
 - [x] T2 Astra review of the reports with examples and priorities. Route: delegated Codex reviewer.
-- [ ] T3 Fix batch by layer (writer per layer, bottom-up), rebase, push, replies. Route: delegated writers.
-- [ ] T4 Clean up scratch files, `cargo clean`, summary. Route: inline.
+- [x] T3 Fix batch by layer (writer per layer, bottom-up), rebase, push, replies. Route: delegated writers.
+- [x] T4 Clean up scratch files, `cargo clean`, summary. Route: inline.
 
 ## Progress and evidence
 
@@ -35,3 +35,7 @@ Same as `nicolaw-v1-stack`. Fixes keep Spanish UI copy, English code. No new pro
 - Route: one writer per layer, bottom-up: foundation (F01 bundle script and menu/Quit action, F09 grouped search, F13 locator truthfulness, F14 deletion of temp copies, F16 source row, F17 validation copy and case identity, top navigation), transcription (F02 capture health, F03 control bounds and responsive layout, F04 safe shutdown, F05 storage worker, F06 speaker marker, F08 refine finish, F12 model repair, F15 live strip, F18 follow-live scroll, F19 model panel, microphone default and resolved name, downloads blocked while live, failed segment marker, capture failure state), analysis (F03 panel breakpoint and drawer, F07 revisions, F11 per-segment analysis state, F06 re-analysis, stop_review on Finalizar, question gap), classification (F10 copy "Puntuación del modelo; no calibrada", wider real tests, calibration plan in README).
 - Accepted Astra recommendations that change current behavior: Cohere refinement is not loaded during live capture; it becomes an explicit post-hearing action. The decision label stays visible (accepted in jev-style-decision) with the uncalibrated-score wording.
 - Not done in this round: transcript FTS, app-level encryption, semantic retrieval. Recorded as limits.
+- T3: foundation 9fbc918..b801b47 (9 commits), transcription f7e9f3a..210bf33 (6), analysis 25f8cf5..357d036 (7), classification ac2d79b..d70cfec (4). Stack rebased after each layer and pushed. Tests on `classification`: 267 passed, 9 ignored. Real decider: four labels correct on the hand-picked pairs; calibration seed (24 pairs): contradicts 5/6, consistent 6/6, unrelated 6/6, insufficient 0/6 (4 labeled consistent at 1.000). The decision step saturates; `DECISION_MIN` alone cannot calibrate it.
+- T4: `cargo clean` after each layer. qa/ stays untracked with the reports, the app bundle, and the microphone diagnostic for round 2.
+- Pending for round 2 (needs the desktop unlocked): visual check of the Audiencias layout at 1280x820 and 900x600, real microphone capture with health states, Cmd+Q while live, the Sol checklist in qa/round-1/astra-review.md section 6.
+- Known gaps: transcript height at 900x600 with a very long error (2 px); OCR line grouping merges close lines (src/extract/macos.rs); decision step never chooses "insufficient".

@@ -39,10 +39,16 @@ impl Backend for NativeBackend {
         Ok(Engines {
             vad: Box::new(SileroVad::load(&models.vad)?),
             transcriber: Box::new(NativeTranscriber::load(&models.live)?),
-            refiner: match &models.refine {
-                Some(path) => Some(Box::new(NativeTranscriber::load(path)?)),
-                None => None,
-            },
+            // The refine pass is optional. If its model does not load, the live text stays.
+            refiner: models.refine.as_deref().and_then(|path| {
+                match NativeTranscriber::load(path) {
+                    Ok(refiner) => Some(Box::new(refiner) as Box<dyn Transcriber>),
+                    Err(error) => {
+                        eprintln!("The refine model did not load ({error:?}). No refine pass.");
+                        None
+                    }
+                }
+            }),
         })
     }
 

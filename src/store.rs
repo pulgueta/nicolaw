@@ -745,6 +745,7 @@ impl Store {
     }
 
     /// The text of the live transcription, if a later text replaced it.
+    #[cfg(test)]
     pub fn live_text(&self, id: i64) -> rusqlite::Result<Option<String>> {
         self.conn.query_row(
             "SELECT live_text FROM segments WHERE id = ?1",

@@ -2616,6 +2616,21 @@ impl HearingsView {
         cx.notify();
     }
 
+    /// Scrolls the transcript to the statement of a suggestion. In a narrow window, the
+    /// drawer closes so that the statement shows.
+    fn show_statement(&mut self, segment_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.id == segment_id)
+        else {
+            return;
+        };
+        self.close_suggestions(window, cx);
+        self.transcript_scroll.scroll_to_item(index);
+        cx.notify();
+    }
+
     /// The new hearing button and the hearing rows. In the drawer, a selection closes it.
     fn render_list_body(&self, view: WeakEntity<Self>, drawer: bool, cx: &App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
@@ -3486,6 +3501,12 @@ impl HearingsView {
             page: suggestion.page,
         };
         let label = |text: &'static str| div().text_xs().text_color(muted).child(text);
+        let segment_id = suggestion.segment_id;
+        let statement_time = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .map(|segment| format_time(segment.t_start_ms));
         let (quote, short) = if self.full_quotes.contains(&id) {
             (suggestion.evidence_quote.clone(), false)
         } else {
@@ -3555,7 +3576,30 @@ impl HearingsView {
                     .children(status),
             )
             .children(stale)
-            .child(label("Declaración"))
+            .child(
+                // The claim is a sentence that the language model wrote, not a quote: the
+                // statement and its time are one click away.
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(label("Afirmación extraída"))
+                    .children(statement_time.clone().map(|time| {
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Declaración {time}"))
+                    }))
+                    .children(statement_time.map(|_| {
+                        Button::new(("show-statement", id as u64))
+                            .link()
+                            .xsmall()
+                            .label("Ver declaración")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.show_statement(segment_id, window, cx)
+                            }))
+                    })),
+            )
             .child(div().text_sm().child(claim))
             .child(label("Prueba"))
             .child(
@@ -5652,6 +5696,46 @@ mod tests {
         assert!(short.ends_with("palabra…"), "{short}");
         assert!(short.chars().count() <= super::SHORT_QUOTE + 1);
         assert_eq!(super::short_quote(HOTEL), (HOTEL.to_owned(), false));
+    }
+
+    #[gpui_kit::test]
+    async fn ver_declaracion_scrolls_to_the_statement_of_the_claim(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "statement");
+        let (hearing, first) = add_hearing(&store, case);
+        for n in 1..=60 {
+            let id = store
+                .insert_segment(hearing, 10_000 + n * 1_000, Speaker::Other)
+                .unwrap();
+            store
+                .finish_segment(id, &format!("Pregunta número {n}."), 10_500 + n * 1_000)
+                .unwrap();
+        }
+        let id = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                first,
+                chunk,
+                SuggestionLevel::Check,
+            ))
+            .unwrap()
+            .id as u64;
+        let dirs = model_dirs("statement", true);
+        let (window, view) = open_pair("statement", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).segments.len() == 61)
+            .await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("show-statement", id)).is_some()
+        })
+        .await;
+        let frame = bounds(cx, window, "transcript-frame");
+        assert!(!bounds(cx, window, ("segment", first as u64)).intersects(&frame));
+
+        click(cx, window, ("show-statement", id));
+        cx.run_until_parked();
+
+        assert!(bounds(cx, window, ("segment", first as u64)).intersects(&frame));
     }
 
     #[gpui_kit::test]

@@ -2068,6 +2068,14 @@ impl HearingsView {
             .unwrap_or(Filter::All)
     }
 
+    /// Reads the suggestions of the selected hearing again. A deleted evidence file removes its
+    /// suggestions from the store.
+    pub fn reload_suggestions(&self, cx: &mut Context<Self>) {
+        if let Some(hearing_id) = self.selected {
+            self.load_suggestions(hearing_id, cx);
+        }
+    }
+
     /// Reads the suggestions of the hearing and their counts from the store.
     fn load_suggestions(&self, hearing_id: i64, cx: &mut Context<Self>) {
         let store = self.store.clone();

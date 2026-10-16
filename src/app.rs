@@ -1017,6 +1017,9 @@ impl FilesView {
                                     this.screen = if *index == 0 {
                                         Screen::Evidence
                                     } else {
+                                        this.hearings.update(cx, |hearings, cx| {
+                                            hearings.reload_suggestions(cx)
+                                        });
                                         Screen::Hearings
                                     };
                                     cx.notify();
@@ -2784,5 +2787,78 @@ mod tests {
             assert!(window.find(("page", 2u64)).visible());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn suggestions_of_deleted_evidence_are_gone_after_a_return_to_the_hearings(
+        cx: &mut TestAppContext,
+    ) {
+        let path = temp_dir("deleted-source").join("acta.txt");
+        fs::write(&path, "x").unwrap();
+        let (store, case) = store_with_case();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let page = Page {
+            number: 1,
+            text: "La declaración del acusado fue rendida en Bogotá.".into(),
+            source: PageSource::Text,
+        };
+        store.save_analysis(evidence, &[page]).unwrap();
+        let chunk = store.search(case, "declaracion", 1).unwrap()[0].chunk_id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store.insert_segment(hearing, 0, Speaker::Accused).unwrap();
+        store
+            .finish_segment(segment, "Declaré en Medellín.", 2_000)
+            .unwrap();
+        let suggestion = store
+            .insert_suggestion(&NewSuggestion {
+                hearing_id: hearing,
+                segment_id: segment,
+                chunk_id: chunk,
+                claim: "El acusado declaró en Medellín.".into(),
+                claim_quote: None,
+                evidence_quote: "fue rendida en Bogotá".into(),
+                kind: None,
+                level: SuggestionLevel::Check,
+                nli_contradiction: 0.7,
+                explanation: None,
+            })
+            .unwrap()
+            .id as u64;
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click(("hearing", hearing as u64), cx)
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("source", suggestion)).is_some()
+        })
+        .await;
+
+        cx.update_window(window, |_, window, cx| window.click("screen-evidence", cx))
+            .unwrap();
+        cx.update(|cx| {
+            view.read(cx)
+                .store
+                .lock()
+                .unwrap()
+                .delete(evidence)
+                .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+                && window.try_find(("source", suggestion)).is_none()
+        })
+        .await;
     }
 }

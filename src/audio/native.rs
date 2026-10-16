@@ -39,17 +39,11 @@ impl Backend for NativeBackend {
         Ok(Engines {
             vad: Box::new(SileroVad::load(&models.vad)?),
             transcriber: Box::new(NativeTranscriber::load(&models.live)?),
-            // The refine pass is optional. If its model does not load, the live text stays.
-            refiner: models.refine.as_deref().and_then(|path| {
-                match NativeTranscriber::load(path) {
-                    Ok(refiner) => Some(Box::new(refiner) as Box<dyn Transcriber>),
-                    Err(error) => {
-                        eprintln!("The refine model did not load ({error:?}). No refine pass.");
-                        None
-                    }
-                }
-            }),
         })
+    }
+
+    fn load_refiner(&self, path: &Path) -> Result<Box<dyn Transcriber>, AudioError> {
+        Ok(Box::new(NativeTranscriber::load(path)?))
     }
 
     fn open_microphone(
@@ -80,6 +74,17 @@ impl Backend for NativeBackend {
             ErrorKind::DeviceUnavailable => AudioError::NoMicrophone,
             _ => AudioError::Microphone,
         })?;
+        // A local diagnostic: the device that is open and the formats, not the audio.
+        let info = recorder.info();
+        eprintln!(
+            "Microphone open: \"{}\" (requested: {}), device format {:?}, sink format {:?}, \
+             {} frames per chunk",
+            info.device.name,
+            device.unwrap_or("system default"),
+            info.device_format,
+            info.format,
+            info.frames_per_chunk,
+        );
         Ok(Box::new(NativeCapture { recorder, input }))
     }
 }
@@ -135,6 +140,10 @@ impl Capture for NativeCapture {
     fn stop(&mut self) {
         // The audio until the stop is already in the input.
         self.recorder.stop().ok();
+    }
+
+    fn device_name(&self) -> String {
+        self.recorder.info().device.name.clone()
     }
 }
 

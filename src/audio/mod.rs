@@ -6,7 +6,7 @@ pub mod native;
 pub mod pipeline;
 pub mod segmenter;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pipeline::Input;
 
@@ -37,20 +37,17 @@ pub trait Transcriber: Send {
     fn finish(&mut self) -> Result<String, AudioError>;
 }
 
-/// The model files for a hearing.
+/// The model files for a hearing recording.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPaths {
     pub live: PathBuf,
     pub vad: PathBuf,
-    /// The model of the optional refine pass.
-    pub refine: Option<PathBuf>,
 }
 
-/// The loaded models of a hearing.
+/// The loaded models of a hearing recording.
 pub struct Engines {
     pub vad: Box<dyn Vad>,
     pub transcriber: Box<dyn Transcriber>,
-    pub refiner: Option<Box<dyn Transcriber>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +61,9 @@ pub struct Microphone {
 pub trait Capture: Send {
     fn start(&mut self) -> Result<(), AudioError>;
     fn stop(&mut self);
+    /// The name of the device that is open. For the system default, this is the device that
+    /// the system selected at open.
+    fn device_name(&self) -> String;
 }
 
 /// What a hearing needs from the machine: microphones and models. The app uses
@@ -72,6 +72,8 @@ pub trait Capture: Send {
 pub trait Backend: Send + Sync {
     fn microphones(&self) -> Result<Vec<Microphone>, AudioError>;
     fn load(&self, models: &ModelPaths) -> Result<Engines, AudioError>;
+    /// Loads the model of the refine pass after a hearing. Drop it to unload it.
+    fn load_refiner(&self, path: &Path) -> Result<Box<dyn Transcriber>, AudioError>;
     /// Asks for the microphone permission if necessary, then opens the microphone. `device` is
     /// a [`Microphone::id`], or `None` for the system default.
     fn open_microphone(
@@ -87,9 +89,13 @@ pub enum AudioError {
     /// No live transcription model or no voice detection model is installed.
     NoModel,
     NoMicrophone,
+    /// The microphone that the user selected is not connected.
+    MicrophoneMissing,
     PermissionDenied,
     /// The model is in use by an other recording.
     Busy,
+    /// The refine pass of a hearing runs: a recording cannot start.
+    Refining,
     ModelLoad,
     /// The microphone cannot open, or it stopped during the recording.
     Microphone,
@@ -109,6 +115,9 @@ impl AudioError {
             Self::NoMicrophone => {
                 "Nicolaw no encuentra un micrófono. Conecte un micrófono y seleccione Iniciar."
             }
+            Self::MicrophoneMissing => {
+                "El micrófono seleccionado no está disponible. Seleccione otro."
+            }
             Self::PermissionDenied => {
                 "Nicolaw no tiene permiso para usar el micrófono. Abra Configuración del Sistema \
                  > Privacidad y seguridad > Micrófono y active el permiso."
@@ -116,9 +125,9 @@ impl AudioError {
             Self::Busy => {
                 "El modelo de voz está en uso. Finalice la otra audiencia y seleccione Iniciar."
             }
-            Self::ModelLoad => {
-                "Nicolaw no puede cargar el modelo de voz. Descargue el modelo de nuevo."
-            }
+            // The files are checked before the load, so this is not a damaged file.
+            Self::Refining => "Espere a que termine el refinamiento de la transcripción.",
+            Self::ModelLoad => "Nicolaw no pudo cargar el modelo.",
             Self::Microphone => {
                 "El micrófono dejó de funcionar. Nicolaw guardó la transcripción hasta este punto."
             }

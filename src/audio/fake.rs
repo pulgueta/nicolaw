@@ -1,5 +1,6 @@
 //! Fake voice detection and transcription for tests.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::pipeline::Input;
@@ -7,23 +8,41 @@ use super::{
     AudioError, Backend, Capture, Engines, Microphone, ModelPaths, Partial, Transcriber, Vad,
 };
 
-/// A machine with one microphone. The test sends the audio: [`FakeBackend::input`] is the
+/// A machine with microphones. The test sends the audio: [`FakeBackend::input`] is the
 /// processor input while the fake microphone records.
 #[derive(Clone)]
 pub struct FakeBackend {
     /// The final text of each segment.
     pub text: String,
+    /// The final text of each segment in the refine pass.
+    pub refined: String,
+    pub microphones: Vec<Microphone>,
     pub input: Arc<Mutex<Option<async_channel::Sender<Input>>>>,
     /// The models that the last `load` received.
     pub loaded: Arc<Mutex<Option<ModelPaths>>>,
+    /// The device that the last `open_microphone` received: `Some(None)` is the system
+    /// default.
+    pub opened: Arc<Mutex<Option<Option<String>>>>,
+    /// The model that the last `load_refiner` received, and true while it is loaded.
+    pub refiner: Arc<Mutex<Option<std::path::PathBuf>>>,
+    pub refiner_loaded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeBackend {
     pub fn new(text: &str) -> Self {
         Self {
             text: text.to_owned(),
+            refined: text.to_owned(),
+            microphones: vec![Microphone {
+                id: "fake".into(),
+                name: "Micrófono de prueba".into(),
+                is_default: true,
+            }],
             input: Arc::default(),
             loaded: Arc::default(),
+            opened: Arc::default(),
+            refiner: Arc::default(),
+            refiner_loaded: Arc::default(),
         }
     }
 
@@ -41,11 +60,7 @@ impl FakeBackend {
 
 impl Backend for FakeBackend {
     fn microphones(&self) -> Result<Vec<Microphone>, AudioError> {
-        Ok(vec![Microphone {
-            id: "fake".into(),
-            name: "Micrófono de prueba".into(),
-            is_default: true,
-        }])
+        Ok(self.microphones.clone())
     }
 
     fn load(&self, models: &ModelPaths) -> Result<Engines, AudioError> {
@@ -53,25 +68,80 @@ impl Backend for FakeBackend {
         Ok(Engines {
             vad: Box::new(FakeVad),
             transcriber: Box::new(FakeTranscriber::new(&self.text)),
-            refiner: None,
         })
+    }
+
+    fn load_refiner(&self, path: &Path) -> Result<Box<dyn Transcriber>, AudioError> {
+        *self.refiner.lock().unwrap() = Some(path.to_owned());
+        Ok(Box::new(FakeRefiner {
+            transcriber: FakeTranscriber::new(&self.refined),
+            loaded: LoadedFlag::new(self.refiner_loaded.clone()),
+        }))
     }
 
     fn open_microphone(
         &self,
-        _device: Option<&str>,
+        device: Option<&str>,
         input: async_channel::Sender<Input>,
     ) -> Result<Box<dyn Capture>, AudioError> {
+        *self.opened.lock().unwrap() = Some(device.map(str::to_owned));
+        let name = self
+            .microphones
+            .iter()
+            .find(|microphone| match device {
+                Some(id) => microphone.id == id,
+                None => microphone.is_default,
+            })
+            .map(|microphone| microphone.name.clone())
+            .ok_or(AudioError::NoMicrophone)?;
         Ok(Box::new(FakeCapture {
             input,
             slot: self.input.clone(),
+            name,
         }))
+    }
+}
+
+/// True from the load of the fake refine model until its drop.
+struct LoadedFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl LoadedFlag {
+    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for LoadedFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct FakeRefiner {
+    transcriber: FakeTranscriber,
+    loaded: LoadedFlag,
+}
+
+impl Transcriber for FakeRefiner {
+    fn begin(&mut self) -> Result<(), AudioError> {
+        let _ = &self.loaded;
+        self.transcriber.begin()
+    }
+
+    fn feed(&mut self, audio: &[f32]) -> Result<Option<Partial>, AudioError> {
+        self.transcriber.feed(audio)
+    }
+
+    fn finish(&mut self) -> Result<String, AudioError> {
+        self.transcriber.finish()
     }
 }
 
 struct FakeCapture {
     input: async_channel::Sender<Input>,
     slot: Arc<Mutex<Option<async_channel::Sender<Input>>>>,
+    name: String,
 }
 
 impl Capture for FakeCapture {
@@ -82,6 +152,10 @@ impl Capture for FakeCapture {
 
     fn stop(&mut self) {
         self.slot.lock().unwrap().take();
+    }
+
+    fn device_name(&self) -> String {
+        self.name.clone()
     }
 }
 

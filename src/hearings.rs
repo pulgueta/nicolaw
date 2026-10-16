@@ -3462,15 +3462,21 @@ impl HearingsView {
         let muted = cx.theme().muted_foreground;
         let id = suggestion.id;
         let level = match suggestion.level {
-            SuggestionLevel::Conflict => Tag::danger().small().child("Posible conflicto"),
-            SuggestionLevel::Check => Tag::warning().small().child("Revisar"),
-        };
-        let status = match suggestion.status {
-            SuggestionStatus::Open => None,
-            SuggestionStatus::Confirmed => Some(Tag::success().small().child("Confirmada")),
-            SuggestionStatus::Dismissed => Some(Tag::secondary().small().child("Descartada")),
-            SuggestionStatus::Stale => Some(Tag::secondary().small().child("Desactualizada")),
-        };
+            SuggestionLevel::Conflict => Tag::danger(),
+            SuggestionLevel::Check => Tag::warning(),
+        }
+        .small()
+        .child(level_label(suggestion.level, suggestion.decision));
+        let status = status_label(suggestion.status).map(|label| {
+            let tag = match suggestion.status {
+                SuggestionStatus::Confirmed => Tag::success(),
+                _ => Tag::secondary(),
+            };
+            div()
+                .id(("status", id as u64))
+                .child(tag.small().child(label))
+                .test_support()
+        });
         let stale = (suggestion.status == SuggestionStatus::Stale).then(|| {
             div()
                 .id(("stale-note", id as u64))
@@ -3577,13 +3583,29 @@ impl HearingsView {
                     .children(status),
             )
             .children(suggestion.decision.map(|decision| {
-                div()
-                    .id(("decision", id as u64))
-                    .child(Tag::secondary().small().child(decision_label(
-                        decision,
-                        suggestion.decision_p.unwrap_or(0.0),
-                    )))
-                    .test_support()
+                // The score is not a calibrated probability: the card says so.
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(("decision", id as u64))
+                            .child(Tag::secondary().small().child(decision_label(
+                                decision,
+                                suggestion.decision_p.unwrap_or(0.0),
+                            )))
+                            .tooltip(|window, cx| Tooltip::new(UNCALIBRATED).build(window, cx))
+                            .test_support(),
+                    )
+                    .child(
+                        div()
+                            .id(("decision-note", id as u64))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(UNCALIBRATED)
+                            .test_support(),
+                    )
             }))
             .children(stale)
             .child(
@@ -3777,7 +3799,32 @@ pub fn kind_label(kind: SuggestionKind) -> &'static str {
     }
 }
 
-/// The decision step and its probability, for example `Contradice · 92 %`.
+/// The note beside the score of the decision step.
+const UNCALIBRATED: &str = "Puntuación del modelo; no calibrada.";
+
+/// The main text of a card. It says what to review; it does not judge the person.
+pub fn level_label(level: SuggestionLevel, decision: Option<Decision>) -> &'static str {
+    match (level, decision) {
+        (SuggestionLevel::Conflict, _) => "Posible discrepancia. Revise la fuente.",
+        (SuggestionLevel::Check, Some(Decision::Insufficient)) => {
+            "Información insuficiente. Revise el contexto."
+        }
+        (SuggestionLevel::Check, _) => "Revisar",
+    }
+}
+
+/// The review of the lawyer, if there is one. "Confirmar" marks the suggestion for the lawyer;
+/// it does not say that the person lied.
+pub fn status_label(status: SuggestionStatus) -> Option<&'static str> {
+    match status {
+        SuggestionStatus::Open => None,
+        SuggestionStatus::Confirmed => Some("Marcada por usted"),
+        SuggestionStatus::Dismissed => Some("Descartada"),
+        SuggestionStatus::Stale => Some("Desactualizada"),
+    }
+}
+
+/// The decision step and its model score, for example `Contradice · 92 %`.
 pub fn decision_label(decision: Decision, probability: f64) -> String {
     let name = match decision {
         Decision::Contradicts => "Contradice",
@@ -4788,7 +4835,7 @@ mod tests {
             .unwrap()
             .id as u64;
         let dirs = model_dirs("decision", true);
-        let (window, _) = open_pair("decision", store, case, &FakeBackend::new(""), &dirs, cx);
+        let (window, view) = open_pair("decision", store, case, &FakeBackend::new(""), &dirs, cx);
         select_hearing(cx, window, hearing).await;
         cx.wait_for(window, WAIT, |window, _| {
             window.try_find(("suggestion", undecided)).is_some()
@@ -4797,6 +4844,56 @@ mod tests {
 
         assert!(shown(cx, window, ("decision", decided)));
         assert!(!shown(cx, window, ("decision", undecided)));
+        // The score is a model score, and the card says so next to it.
+        assert!(shown(cx, window, ("decision-note", decided)));
+        assert!(!shown(cx, window, ("decision-note", undecided)));
+
+        // Confirmar marks the review of the lawyer, not a fact about the person.
+        assert!(shown(cx, window, ("confirm", decided)));
+        view.update(cx, |view, cx| {
+            view.set_suggestion_status(decided as i64, SuggestionStatus::Confirmed, cx)
+        });
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("status", decided)).is_some()
+        })
+        .await;
+        assert!(!shown(cx, window, ("confirm", decided)));
+    }
+
+    #[test]
+    fn card_copy_says_what_to_review_and_never_judges_the_person() {
+        use super::{UNCALIBRATED, level_label, status_label};
+        use crate::store::SuggestionStatus;
+
+        assert_eq!(
+            level_label(SuggestionLevel::Conflict, Some(Decision::Contradicts)),
+            "Posible discrepancia. Revise la fuente."
+        );
+        assert_eq!(
+            level_label(SuggestionLevel::Check, Some(Decision::Insufficient)),
+            "Información insuficiente. Revise el contexto."
+        );
+        assert_eq!(
+            level_label(SuggestionLevel::Check, Some(Decision::Consistent)),
+            "Revisar"
+        );
+        assert_eq!(level_label(SuggestionLevel::Check, None), "Revisar");
+        assert_eq!(
+            status_label(SuggestionStatus::Confirmed),
+            Some("Marcada por usted")
+        );
+        assert_eq!(UNCALIBRATED, "Puntuación del modelo; no calibrada.");
+        let all = [
+            level_label(SuggestionLevel::Conflict, Some(Decision::Contradicts)),
+            level_label(SuggestionLevel::Check, Some(Decision::Insufficient)),
+            status_label(SuggestionStatus::Confirmed).unwrap(),
+            UNCALIBRATED,
+        ];
+        for text in all {
+            for word in ["miente", "mintió", "culpable", "veraz", "verdad", "falso"] {
+                assert!(!text.to_lowercase().contains(word), "{text}");
+            }
+        }
     }
 
     #[gpui_kit::test]

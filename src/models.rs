@@ -321,9 +321,21 @@ pub fn find_files(dirs: &ModelDirs, model: &AnalysisModel) -> Option<Vec<PathBuf
         .iter()
         .map(|file| {
             let path = snapshot_path(dirs, file);
-            path.is_file().then_some(path)
+            (path.is_file() && is_valid_file(&path)).then_some(path)
         })
         .collect()
+}
+
+/// False for a JSON file of an analysis model that does not start with `{`, for example an
+/// error page that a download saved. Other files are not checked.
+pub fn is_valid_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|extension| extension != "json") {
+        return true;
+    }
+    let mut first = [0; 1];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut first))
+        .is_ok_and(|()| first == *b"{")
 }
 
 /// The path of the file in the cache snapshot of its pinned revision.
@@ -347,7 +359,8 @@ pub fn download(
 }
 
 /// Downloads the missing files of an analysis model into the Hugging Face cache. A file that
-/// is already in the cache is not downloaded again, so a failed download continues. Calls
+/// is already in the cache is not downloaded again, so a failed download continues. A file
+/// that is not valid moves aside and downloads again. Calls
 /// `progress` with the part of the model that is done, from 0 to 1. Blocks until the download
 /// ends: do not call this function on the UI thread.
 pub fn download_files(
@@ -360,6 +373,9 @@ pub fn download_files(
     let mut paths = Vec::new();
     for file in model.files {
         let cached = snapshot_path(dirs, file);
+        if cached.is_file() && !is_valid_file(&cached) {
+            quarantine(&cached).map_err(|error| error.to_string())?;
+        }
         if cached.is_file() {
             done_mb += file.size_mb as f32;
             progress(done_mb / total);
@@ -432,7 +448,7 @@ mod tests {
 
     use super::{
         ANALYSIS_MODELS, CATALOG, COHERE, LLM, ModelDirs, NEMOTRON, NLI, Role, SILERO_VAD,
-        discover, find_files, quant, quarantine, write_fake_model,
+        discover, find_files, is_valid_file, quant, quarantine, write_fake_model,
     };
 
     /// Empty Hugging Face cache and Handy model folders in a new temporary folder.
@@ -460,6 +476,7 @@ mod tests {
         let model = CATALOG.iter().find(|model| model.file == file);
         match model {
             Some(model) => write_fake_model(&blob, model),
+            None if file.ends_with(".json") => fs::write(&blob, b"{}").unwrap(),
             None => fs::write(&blob, b"GGUF").unwrap(),
         }
         let link = repo_dir.join("snapshots").join(revision).join(file);
@@ -724,6 +741,28 @@ mod tests {
 
         assert_eq!(find_files(&dirs, &NLI), Some(paths));
         assert_eq!(find_files(&dirs, &LLM), None);
+    }
+
+    #[test]
+    fn a_json_file_that_does_not_start_with_a_brace_is_invalid() {
+        let dirs = dirs("json");
+        let mut paths = Vec::new();
+        for file in NLI.files {
+            paths.push(cache_file(
+                &dirs,
+                file.repo.into(),
+                file.revision,
+                file.file,
+            ));
+        }
+        assert!(find_files(&dirs, &NLI).is_some());
+
+        let config = fs::canonicalize(&paths[0]).unwrap();
+        fs::write(&config, b"<html>not found</html>").unwrap();
+
+        assert_eq!(find_files(&dirs, &NLI), None);
+        assert!(!is_valid_file(&paths[0]));
+        assert!(is_valid_file(&paths[2]), "a weights file has no JSON check");
     }
 
     #[test]

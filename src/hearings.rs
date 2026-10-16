@@ -2225,14 +2225,11 @@ impl HearingsView {
                             Some(cx.background_spawn(analyzer::run(analyzer, queue, events)));
                         this.listen_review(receiver, cx);
                     }
+                    // The files passed the check at discovery, so the cause can be the GPU or
+                    // the memory: the files are not labeled damaged.
                     Some(Err(error)) => {
                         this.review = None;
                         this.message = Some(error.message().into());
-                        // Damaged files: show the models as not installed, so that the panel
-                        // offers the downloads and the switch shows off.
-                        for (_, files) in this.analysis_models.iter_mut().flatten() {
-                            *files = None;
-                        }
                     }
                 }
                 cx.notify();
@@ -3402,8 +3399,8 @@ mod tests {
     use crate::models::{
         ANALYSIS_MODELS, COHERE, ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model,
     };
+    use crate::review::ReviewEvent;
     use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
-    use crate::review::{ReviewError, ReviewEvent};
     use crate::store::{
         NewSuggestion, Segment, Speaker, Store, SuggestionCounts, SuggestionLevel, SuggestionStatus,
     };
@@ -4123,7 +4120,12 @@ mod tests {
                     .join(file.revision)
                     .join(file.file);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, b"x").unwrap();
+                let content: &[u8] = if file.file.ends_with(".json") {
+                    b"{}"
+                } else {
+                    b"x"
+                };
+                fs::write(path, content).unwrap();
             }
         }
     }
@@ -4414,21 +4416,26 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn analysis_models_that_do_not_load_show_the_downloads_again(cx: &mut TestAppContext) {
+    async fn analysis_models_that_do_not_load_are_not_labeled_damaged(cx: &mut TestAppContext) {
         let mut review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
         review.fail = true;
 
         let (window, view, _) = record_with_analysis("analysis-broken", &review, cx).await;
 
-        cx.wait_for(window, WAIT, |window, _| {
-            window.try_find("download-nli").is_some() && window.try_find("download-llm").is_some()
-        })
-        .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).message.is_some())
+            .await;
         cx.update(|cx| {
             let view = view.read(cx);
-            assert!(!view.analysis_on());
-            assert_eq!(view.message, Some(ReviewError::ModelLoad.message().into()));
+            assert_eq!(
+                view.message,
+                Some("Nicolaw no pudo cargar el modelo.".into())
+            );
+            assert!(view.review.is_none());
+            // The files are valid: the panel does not offer a download for them.
+            assert!(view.missing_analysis_models().is_empty());
         });
+        assert!(!shown(cx, window, "download-nli"));
+        assert!(!shown(cx, window, "download-llm"));
     }
 
     #[gpui_kit::test]

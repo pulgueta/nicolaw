@@ -44,9 +44,7 @@ impl ReviewError {
     /// The message for the user.
     pub fn message(self) -> &'static str {
         match self {
-            Self::ModelLoad => {
-                "Nicolaw no puede cargar los modelos de análisis. Descargue los modelos de nuevo."
-            }
+            Self::ModelLoad => "Nicolaw no pudo cargar el modelo.",
             Self::Inference => "Nicolaw no puede analizar una declaración del acusado.",
             Self::Storage => "Nicolaw no puede guardar las sugerencias.",
         }

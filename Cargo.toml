@@ -8,7 +8,17 @@ async-channel = "2.5"
 dirs = "7.0.0"
 gpui-kit = "0.7"
 mime_guess = "2.0.5"
+quick-xml = "0.41"
 rusqlite = { version = "0.40.2", features = ["blob", "bundled"] }
+sha2 = "0.11"
+zip = { version = "5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-pdf-kit = { version = "0.3.2", features = ["objc2-app-kit"] }
+objc2-vision = { version = "0.3.2", features = ["objc2-core-foundation"] }
 
 [profile.dev.package]
 gpui-pre = { opt-level = 3 }

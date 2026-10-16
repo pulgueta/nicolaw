@@ -27,6 +27,8 @@ fn main() {
     std::fs::create_dir_all(&data_dir).expect("Nicolaw cannot create the data folder");
     let store =
         Store::open(&data_dir.join("nicolaw.db")).expect("Nicolaw cannot open the database");
+    // Copies that Abrir wrote in an earlier run. A failure here does not stop the app.
+    app::remove_open_copies(&app::open_copies_dir()).ok();
 
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);

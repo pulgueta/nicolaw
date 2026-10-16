@@ -1,7 +1,9 @@
 use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,6 +51,8 @@ const HITS_PER_GROUP: usize = 20;
 
 const LIST_ERROR: &str = "Nicolaw no puede leer las pruebas.";
 const DELETE_ERROR: &str = "Nicolaw no puede eliminar el archivo. Intente de nuevo.";
+const COPY_DELETE_ERROR: &str =
+    "Se eliminaron los datos de la aplicación. No se pudo eliminar una copia local.";
 const CASE_ERROR: &str = "Nicolaw no puede crear el caso. Intente de nuevo.";
 const SEARCH_ERROR: &str = "Nicolaw no puede buscar. Intente de nuevo.";
 const NO_CASE: &str = "Cree un caso antes de agregar archivos.";
@@ -125,6 +129,8 @@ pub struct FilesView {
     highlighted: HashSet<i64>,
     /// True while Open prepares the file.
     opening: bool,
+    /// The folder of the copies that Open writes. See [`open_copies_dir`].
+    copies: PathBuf,
     /// Evidence that waits for text analysis, in order.
     analysis: VecDeque<i64>,
     /// True while a worker analyzes the evidence in `analysis`.
@@ -218,6 +224,7 @@ impl FilesView {
             saving: false,
             highlighted: HashSet::new(),
             opening: false,
+            copies: open_copies_dir(),
             analysis: VecDeque::new(),
             analyzing: false,
             _subscriptions: subscriptions,
@@ -745,17 +752,12 @@ impl FilesView {
         cx.notify();
         let name = entry.name.clone();
         let store = self.store.clone();
+        let copies = self.copies.clone();
         cx.spawn_in(window, async move |this, cx| {
             let path = cx
                 .background_spawn(async move {
                     let content = store.lock().unwrap().content(entry.id, |_, _| {}).ok()?;
-                    let dir = std::env::temp_dir()
-                        .join("nicolaw")
-                        .join(entry.id.to_string());
-                    fs::create_dir_all(&dir).ok()?;
-                    let path = dir.join(&entry.name);
-                    fs::write(&path, content).ok()?;
-                    Some(path)
+                    write_open_copy(&copies, entry.id, &entry.name, &content).ok()
                 })
                 .await;
 
@@ -806,15 +808,22 @@ impl FilesView {
         };
         self.analysis.retain(|queued| *queued != id);
         let store = self.store.clone();
+        let copies = self.copies.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let files = cx
+            let (files, copy_removed) = cx
                 .background_spawn(async move {
                     let store = store.lock().unwrap();
-                    store.delete(id).map_err(|_| DELETE_ERROR)?;
-                    store.list(case_id).map_err(|_| LIST_ERROR)
+                    if store.delete(id).is_err() {
+                        return (Err(DELETE_ERROR), true);
+                    }
+                    let copy_removed = remove_open_copy(&copies, id).is_ok();
+                    (store.list(case_id).map_err(|_| LIST_ERROR), copy_removed)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
+                if !copy_removed {
+                    window.push_notification((NotificationType::Warning, COPY_DELETE_ERROR), cx);
+                }
                 this.set_files(case_id, files, window, cx);
                 if !this.query.is_empty() {
                     this.run_search(this.query.clone(), window, cx);
@@ -1408,6 +1417,47 @@ fn render_page(page: &Page, locator: String, muted: Hsla) -> impl IntoElement {
         })
 }
 
+/// The folder of the copies that Open writes for the system application, one folder for each
+/// evidence: `<temp>/nicolaw/<id>/<name>`. Nicolaw removes a copy when the evidence is deleted,
+/// and removes all copies at start.
+pub fn open_copies_dir() -> PathBuf {
+    std::env::temp_dir().join("nicolaw")
+}
+
+/// Writes a copy that only the user can read (0600, in a 0700 folder), and returns its path.
+fn write_open_copy(root: &Path, id: i64, name: &str, content: &[u8]) -> io::Result<PathBuf> {
+    let dir = root.join(id.to_string());
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let path = dir.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    // The mode applies only to a new file: set it again for a copy from an earlier version.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(content)?;
+    Ok(path)
+}
+
+/// Removes the copies of one evidence. A missing folder is not an error.
+fn remove_open_copy(root: &Path, id: i64) -> io::Result<()> {
+    remove_dir(&root.join(id.to_string()))
+}
+
+/// Removes all copies, for example the copies that an earlier run did not remove.
+pub fn remove_open_copies(root: &Path) -> io::Result<()> {
+    remove_dir(root)
+}
+
+fn remove_dir(dir: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 /// A file name that takes the free width of its row. A long name is cut, and its tooltip shows
 /// the full name.
 fn file_name_label(id: impl Into<ElementId>, name: &str) -> Stateful<Div> {
@@ -1549,7 +1599,7 @@ mod tests {
         WindowOptions, px, size,
     };
 
-    use super::{FilesView, Loaded, Tab};
+    use super::{FilesView, Loaded, Tab, remove_open_copies, remove_open_copy, write_open_copy};
     use crate::extract::{Page, PageSource};
     use crate::store::{AnalysisStatus, Store};
 
@@ -1821,6 +1871,81 @@ mod tests {
             assert_eq!(view.selected_hit, Some(a_more.chunk_id));
             assert_eq!(view.tab, Tab::Text);
         });
+    }
+
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn an_open_copy_is_private_and_its_removal_is_safe_to_repeat() {
+        let root = temp_dir("copies-private").join("nicolaw");
+        let path = write_open_copy(&root, 7, "acta.txt", b"hola").unwrap();
+
+        assert_eq!(path, root.join("7").join("acta.txt"));
+        assert_eq!(fs::read(&path).unwrap(), b"hola");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&root.join("7")), 0o700);
+        // A second Abrir replaces the copy.
+        write_open_copy(&root, 7, "acta.txt", b"adios").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"adios");
+
+        remove_open_copy(&root, 7).unwrap();
+        assert!(!root.join("7").exists());
+        remove_open_copy(&root, 7).unwrap();
+    }
+
+    #[test]
+    fn stale_copies_are_removed_and_a_failed_removal_is_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_dir("copies-stale").join("nicolaw");
+        write_open_copy(&root, 1, "a.txt", b"a").unwrap();
+        write_open_copy(&root, 2, "b.txt", b"b").unwrap();
+
+        remove_open_copies(&root).unwrap();
+        assert!(!root.exists());
+        remove_open_copies(&root).unwrap();
+
+        write_open_copy(&root, 3, "c.txt", b"c").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let removed = remove_open_copy(&root, 3);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(removed.is_err());
+    }
+
+    #[gpui_kit::test]
+    async fn delete_removes_the_open_copy_of_the_file(cx: &mut TestAppContext) {
+        let path = temp_dir("copy-delete").join("hello.txt");
+        fs::write(&path, "hello").unwrap();
+        let (store, case) = store_with_case();
+        let id = store.import(case, &path, |_, _| {}).unwrap().id;
+        let root = temp_dir("copy-delete-root").join("nicolaw");
+        let copy = write_open_copy(&root, id, "hello.txt", b"hello").unwrap();
+        let (window, view) = open(store, cx);
+        cx.update(|cx| view.update(cx, |view, _| view.copies = root.clone()));
+        let row = ("file", id as u64);
+        cx.wait_for(window, WAIT, |window, _| window.try_find(row).is_some())
+            .await;
+
+        cx.update_window(window, |_, window, cx| window.click(row, cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("delete").is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| window.click("delete", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| window.try_find("ok").is_some())
+            .await;
+        cx.update_window(window, |_, window, cx| window.click("ok", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| window.try_find(row).is_none())
+            .await;
+
+        assert!(!copy.exists());
+        assert!(!root.join(id.to_string()).exists());
+        assert!(path.exists(), "the original file must stay");
     }
 
     #[gpui_kit::test]

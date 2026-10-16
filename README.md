@@ -11,6 +11,10 @@ cargo test
 
 Requires macOS on Apple Silicon.
 
+## Deletion
+
+When you delete a file in Nicolaw, Nicolaw removes the app's data of the file: its stored copy, its extracted text, and the copy that **Abrir** wrote to the temporary folder (`$TMPDIR/nicolaw/<id>`). Nicolaw also removes old **Abrir** copies when it starts. Deletion does not erase the original file that you added, and it does not erase the free pages of the database or the copies in your backups. It is not a secure erasure.
+
 ## Release
 
 ```sh

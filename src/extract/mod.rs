@@ -85,7 +85,11 @@ fn kind(name: &str, mime: &str) -> Kind {
         ("application/pdf", _) | (_, "pdf") => Kind::Pdf,
         (DOCX_MIME, _) | (_, "docx") => Kind::Docx,
         (_, "txt" | "md" | "markdown" | "csv") => Kind::Text,
-        (_, "png" | "jpg" | "jpeg" | "heic" | "heif" | "tif" | "tiff" | "webp") => Kind::Image,
+        (_, "png" | "jpg" | "jpeg" | "heic" | "heif" | "tif" | "tiff" | "webp")
+        | (
+            "image/png" | "image/jpeg" | "image/heic" | "image/heif" | "image/tiff" | "image/webp",
+            _,
+        ) => Kind::Image,
         _ if mime.starts_with("text/") => Kind::Text,
         _ => Kind::Other,
     }
@@ -116,7 +120,7 @@ pub fn extract(name: &str, mime: &str, bytes: &[u8]) -> Result<Vec<Page>, Extrac
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtractError, Page, PageSource, extract};
+    use super::{ExtractError, Kind, Page, PageSource, extract, kind};
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
@@ -173,6 +177,22 @@ mod tests {
             extract("bad.docx", mime, b"not a zip"),
             Err(ExtractError::Unreadable)
         );
+    }
+
+    #[test]
+    fn a_supported_image_mime_type_is_an_image_with_any_extension() {
+        assert_eq!(kind("foto.jfif", "image/jpeg"), Kind::Image);
+        assert_eq!(kind("foto.jpe", "image/jpeg"), Kind::Image);
+        for mime in [
+            "image/png",
+            "image/tiff",
+            "image/heic",
+            "image/heif",
+            "image/webp",
+        ] {
+            assert_eq!(kind("foto", mime), Kind::Image, "{mime}");
+        }
+        assert_eq!(kind("dibujo.svg", "image/svg+xml"), Kind::Other);
     }
 
     #[test]

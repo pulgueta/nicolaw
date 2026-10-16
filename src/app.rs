@@ -905,25 +905,47 @@ impl FilesView {
             .position()
             .map(|(n, total)| format!("Guardando {n} de {total}"));
         let muted = cx.theme().muted_foreground;
+        let case_title = self
+            .case_id
+            .and_then(|id| self.cases.iter().find(|case| case.id == id))
+            .map(|case| SharedString::from(case_title(case)));
         h_flex()
+            .id("top-nav")
             .relative()
             .flex_none()
+            .h(px(48.))
+            .items_center()
             .justify_between()
+            .gap_2()
             .px_4()
-            .py_3()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 h_flex()
+                    .flex_1()
+                    .min_w_0()
                     .gap_2()
                     .items_center()
                     .child(
-                        Select::new(&self.case_select)
-                            .id("case-select")
+                        // The select cuts a long title. The tooltip shows the full title.
+                        div()
+                            .id("case-identity")
+                            .min_w_0()
                             .w(px(260.))
-                            .placeholder("Seleccione un caso")
-                            .accessibility_label("Caso")
-                            .disabled(self.cases.is_empty()),
+                            .child(
+                                Select::new(&self.case_select)
+                                    .id("case-select")
+                                    .w_full()
+                                    .placeholder("Seleccione un caso")
+                                    .accessibility_label("Caso")
+                                    .disabled(self.cases.is_empty()),
+                            )
+                            .when_some(case_title, |identity, title| {
+                                identity.tooltip(move |window, cx| {
+                                    Tooltip::new(title.clone()).build(window, cx)
+                                })
+                            })
+                            .test_support(),
                     )
                     .child(
                         Button::new("new-case")
@@ -942,6 +964,7 @@ impl FilesView {
             )
             .child(
                 Button::new("add-files")
+                    .flex_none()
                     .primary()
                     .icon(IconName::Plus)
                     .label("Agregar archivos")
@@ -959,6 +982,13 @@ impl FilesView {
                     ),
                 )
             })
+            .test_support()
+    }
+
+    /// The row under the top navigation for the controls of a live hearing. The hearings layer
+    /// fills it; without a live hearing it shows nothing.
+    fn render_live_strip(&self, _: &mut Context<Self>) -> Option<AnyElement> {
+        None
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1651,6 +1681,7 @@ impl Render for FilesView {
                 this.add_files(paths.paths().to_vec(), window, cx)
             }))
             .child(self.render_header(cx))
+            .children(self.render_live_strip(cx))
             .child(body)
     }
 }
@@ -1872,6 +1903,33 @@ mod tests {
                 format!("caso de prueba · Caso {}", second.id)
             );
         });
+    }
+
+    #[gpui_kit::test]
+    async fn the_top_navigation_is_48_pixels_high_and_a_long_case_name_does_not_push_it(
+        cx: &mut TestAppContext,
+    ) {
+        let store = Store::open_in_memory().unwrap();
+        let long = "Proceso penal contra el señor Juan de la Cruz Rodríguez Martínez ".repeat(4);
+        let case = store.create_case(long.trim()).unwrap().id;
+        store.set_setting("last_case", &case.to_string()).unwrap();
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+
+        cx.update_window(window, |_, window, _| {
+            let viewport = window.viewport_size();
+            let nav = window.find("top-nav").bounds();
+            assert_eq!(nav.size.height, px(48.));
+            assert_eq!(nav.top(), px(0.));
+            let identity = window.find("case-identity").bounds();
+            let new_case = window.find("new-case").bounds();
+            let add = window.find("add-files").bounds();
+            assert!(identity.right() <= new_case.left());
+            assert!(add.right() <= viewport.width);
+            assert!(new_case.bottom() <= nav.bottom());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

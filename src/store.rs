@@ -499,14 +499,19 @@ fn row_to_evidence(row: &rusqlite::Row) -> rusqlite::Result<Evidence> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rusqlite::Connection;
 
     use super::{AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, Store};
     use crate::extract::{Page, PageSource};
 
+    /// A new file in its own folder, so that tests that run at the same time do not change the
+    /// file of an other test during an import.
     fn temp_file(name: &str, content: &[u8]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nicolaw-test-{}", std::process::id()));
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nicolaw-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         fs::write(&path, content).unwrap();

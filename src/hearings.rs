@@ -39,7 +39,7 @@ use crate::models::{
     NEMOTRON, SILERO_VAD,
 };
 use crate::review::analyzer::{self, Analyzer, Job, JobQueue, ModelGate, text_hash};
-use crate::review::{ReviewBackend, ReviewError, ReviewEvent};
+use crate::review::{Decision, ReviewBackend, ReviewError, ReviewEvent};
 use crate::store::{
     AnalysisState, Hearing, Segment, Speaker, Store, Suggestion, SuggestionCounts, SuggestionKind,
     SuggestionLevel, SuggestionStatus, locator_label,
@@ -3450,8 +3450,9 @@ impl HearingsView {
             )
     }
 
-    /// One suggestion: level, kind, the claim with the conflicting words in bold, the
-    /// evidence passage with its file and page, the explanation, and the decision buttons.
+    /// One suggestion: level, kind, the decision step, the claim with the conflicting words in
+    /// bold, the evidence passage with its file and page, the explanation, and the decision
+    /// buttons.
     fn render_card(
         &self,
         suggestion: &Suggestion,
@@ -3461,15 +3462,21 @@ impl HearingsView {
         let muted = cx.theme().muted_foreground;
         let id = suggestion.id;
         let level = match suggestion.level {
-            SuggestionLevel::Conflict => Tag::danger().small().child("Posible conflicto"),
-            SuggestionLevel::Check => Tag::warning().small().child("Revisar"),
-        };
-        let status = match suggestion.status {
-            SuggestionStatus::Open => None,
-            SuggestionStatus::Confirmed => Some(Tag::success().small().child("Confirmada")),
-            SuggestionStatus::Dismissed => Some(Tag::secondary().small().child("Descartada")),
-            SuggestionStatus::Stale => Some(Tag::secondary().small().child("Desactualizada")),
-        };
+            SuggestionLevel::Conflict => Tag::danger(),
+            SuggestionLevel::Check => Tag::warning(),
+        }
+        .small()
+        .child(level_label(suggestion.level, suggestion.decision));
+        let status = status_label(suggestion.status).map(|label| {
+            let tag = match suggestion.status {
+                SuggestionStatus::Confirmed => Tag::success(),
+                _ => Tag::secondary(),
+            };
+            div()
+                .id(("status", id as u64))
+                .child(tag.small().child(label))
+                .test_support()
+        });
         let stale = (suggestion.status == SuggestionStatus::Stale).then(|| {
             div()
                 .id(("stale-note", id as u64))
@@ -3575,6 +3582,31 @@ impl HearingsView {
                     )
                     .children(status),
             )
+            .children(suggestion.decision.map(|decision| {
+                // The score is not a calibrated probability: the card says so.
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(("decision", id as u64))
+                            .child(Tag::secondary().small().child(decision_label(
+                                decision,
+                                suggestion.decision_p.unwrap_or(0.0),
+                            )))
+                            .tooltip(|window, cx| Tooltip::new(UNCALIBRATED).build(window, cx))
+                            .test_support(),
+                    )
+                    .child(
+                        div()
+                            .id(("decision-note", id as u64))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(UNCALIBRATED)
+                            .test_support(),
+                    )
+            }))
             .children(stale)
             .child(
                 // The claim is a sentence that the language model wrote, not a quote: the
@@ -3767,6 +3799,42 @@ pub fn kind_label(kind: SuggestionKind) -> &'static str {
     }
 }
 
+/// The note beside the score of the decision step.
+const UNCALIBRATED: &str = "Puntuación del modelo; no calibrada.";
+
+/// The main text of a card. It says what to review; it does not judge the person.
+pub fn level_label(level: SuggestionLevel, decision: Option<Decision>) -> &'static str {
+    match (level, decision) {
+        (SuggestionLevel::Conflict, _) => "Posible discrepancia. Revise la fuente.",
+        (SuggestionLevel::Check, Some(Decision::Insufficient)) => {
+            "Información insuficiente. Revise el contexto."
+        }
+        (SuggestionLevel::Check, _) => "Revisar",
+    }
+}
+
+/// The review of the lawyer, if there is one. "Confirmar" marks the suggestion for the lawyer;
+/// it does not say that the person lied.
+pub fn status_label(status: SuggestionStatus) -> Option<&'static str> {
+    match status {
+        SuggestionStatus::Open => None,
+        SuggestionStatus::Confirmed => Some("Marcada por usted"),
+        SuggestionStatus::Dismissed => Some("Descartada"),
+        SuggestionStatus::Stale => Some("Desactualizada"),
+    }
+}
+
+/// The decision step and its model score, for example `Contradice · 92 %`.
+pub fn decision_label(decision: Decision, probability: f64) -> String {
+    let name = match decision {
+        Decision::Contradicts => "Contradice",
+        Decision::Consistent => "Compatible",
+        Decision::Unrelated => "No relacionada",
+        Decision::Insufficient => "Insuficiente",
+    };
+    format!("{name} · {:.0} %", probability * 100.0)
+}
+
 /// One transcript item: a small row with the time, the speaker, a note, and the actions (the
 /// correction of the speaker and the analysis state),
 /// then the statement at full width.
@@ -3878,7 +3946,8 @@ mod tests {
 
     use super::{
         Filter, HearingsEnv, HearingsView, Recording, SAVE_ERROR, StartRecording, SwitchSpeaker,
-        TogglePause, format_time, register_actions, render_live_strip, speaker_label, status_text,
+        TogglePause, decision_label, format_time, register_actions, render_live_strip,
+        speaker_label, status_text,
     };
     use crate::audio::fake::FakeBackend;
     use crate::audio::pipeline::Event;
@@ -3887,6 +3956,7 @@ mod tests {
     use crate::models::{
         ANALYSIS_MODELS, COHERE, ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model,
     };
+    use crate::review::Decision;
     use crate::review::ReviewEvent;
     use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
     use crate::store::{
@@ -4143,6 +4213,26 @@ mod tests {
     fn speakers_have_spanish_labels() {
         assert_eq!(speaker_label(Speaker::Accused), "Acusado");
         assert_eq!(speaker_label(Speaker::Other), "Otra persona");
+    }
+
+    #[test]
+    fn decisions_have_spanish_labels_with_a_percent() {
+        assert_eq!(
+            decision_label(Decision::Contradicts, 0.918),
+            "Contradice · 92 %"
+        );
+        assert_eq!(
+            decision_label(Decision::Consistent, 1.0),
+            "Compatible · 100 %"
+        );
+        assert_eq!(
+            decision_label(Decision::Unrelated, 0.5),
+            "No relacionada · 50 %"
+        );
+        assert_eq!(
+            decision_label(Decision::Insufficient, 0.004),
+            "Insuficiente · 0 %"
+        );
     }
 
     #[gpui_kit::test]
@@ -4661,6 +4751,8 @@ mod tests {
             nli_contradiction: 0.95,
             explanation: Some("El registro ubica al acusado en Bogotá.".into()),
             segment_revision: 0,
+            decision: None,
+            decision_p: None,
         }
     }
 
@@ -4722,6 +4814,86 @@ mod tests {
         });
         assert!(shown(cx, window, ("confirm", id)));
         assert!(shown(cx, window, ("source", id)));
+    }
+
+    #[gpui_kit::test]
+    async fn a_card_shows_the_decision_only_when_the_suggestion_has_one(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "decision");
+        let (hearing, segment) = add_hearing(&store, case);
+        let mut decided = new_suggestion(hearing, segment, chunk, SuggestionLevel::Check);
+        decided.decision = Some(Decision::Insufficient);
+        decided.decision_p = Some(0.61);
+        let decided = store.insert_suggestion(&decided).unwrap().id as u64;
+        let undecided = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Check,
+            ))
+            .unwrap()
+            .id as u64;
+        let dirs = model_dirs("decision", true);
+        let (window, view) = open_pair("decision", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("suggestion", undecided)).is_some()
+        })
+        .await;
+
+        assert!(shown(cx, window, ("decision", decided)));
+        assert!(!shown(cx, window, ("decision", undecided)));
+        // The score is a model score, and the card says so next to it.
+        assert!(shown(cx, window, ("decision-note", decided)));
+        assert!(!shown(cx, window, ("decision-note", undecided)));
+
+        // Confirmar marks the review of the lawyer, not a fact about the person.
+        assert!(shown(cx, window, ("confirm", decided)));
+        view.update(cx, |view, cx| {
+            view.set_suggestion_status(decided as i64, SuggestionStatus::Confirmed, cx)
+        });
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("status", decided)).is_some()
+        })
+        .await;
+        assert!(!shown(cx, window, ("confirm", decided)));
+    }
+
+    #[test]
+    fn card_copy_says_what_to_review_and_never_judges_the_person() {
+        use super::{UNCALIBRATED, level_label, status_label};
+        use crate::store::SuggestionStatus;
+
+        assert_eq!(
+            level_label(SuggestionLevel::Conflict, Some(Decision::Contradicts)),
+            "Posible discrepancia. Revise la fuente."
+        );
+        assert_eq!(
+            level_label(SuggestionLevel::Check, Some(Decision::Insufficient)),
+            "Información insuficiente. Revise el contexto."
+        );
+        assert_eq!(
+            level_label(SuggestionLevel::Check, Some(Decision::Consistent)),
+            "Revisar"
+        );
+        assert_eq!(level_label(SuggestionLevel::Check, None), "Revisar");
+        assert_eq!(
+            status_label(SuggestionStatus::Confirmed),
+            Some("Marcada por usted")
+        );
+        assert_eq!(UNCALIBRATED, "Puntuación del modelo; no calibrada.");
+        let all = [
+            level_label(SuggestionLevel::Conflict, Some(Decision::Contradicts)),
+            level_label(SuggestionLevel::Check, Some(Decision::Insufficient)),
+            status_label(SuggestionStatus::Confirmed).unwrap(),
+            UNCALIBRATED,
+        ];
+        for text in all {
+            for word in ["miente", "mintió", "culpable", "veraz", "verdad", "falso"] {
+                assert!(!text.to_lowercase().contains(word), "{text}");
+            }
+        }
     }
 
     #[gpui_kit::test]

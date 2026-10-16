@@ -82,10 +82,17 @@ pub trait Nli: Send {
     }
 }
 
+/// The second stage of the analysis, in the shape of a Jev `choice` question: for one claim
+/// and one passage, the probability of each [`Decision`].
+pub trait Decider: Send {
+    fn decide(&mut self, claim: &str, passage: &str) -> Result<DecisionScores, ReviewError>;
+}
+
 /// The loaded analysis models.
 pub struct Engines {
     pub llm: Box<dyn Llm>,
     pub nli: Box<dyn Nli>,
+    pub decider: Box<dyn Decider>,
 }
 
 /// Loads the analysis models. The app uses [`native::NativeReview`]; tests use a fake. The
@@ -104,6 +111,100 @@ pub const CONFLICT_MIN: f32 = 0.85;
 pub const CONFLICT_MARGIN: f32 = 0.5;
 /// A pair needs a check at or above this probability of contradiction.
 pub const CHECK_MIN: f32 = 0.60;
+
+/// A conflict stays a conflict only when the decision is [`Decision::Contradicts`] with at
+/// least this probability. This is an initial value: tune it on labeled Spanish hearing data.
+pub const DECISION_MIN: f32 = 0.60;
+
+/// The options of the decision step. The store keeps them as TEXT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// The claim cannot be true if the passage is true.
+    Contradicts,
+    /// The passage supports or permits the claim.
+    Consistent,
+    /// The passage does not address the claim.
+    Unrelated,
+    /// The passage is not clear enough to decide (abstain).
+    Insufficient,
+}
+
+impl Decision {
+    pub const ALL: [Self; 4] = [
+        Self::Contradicts,
+        Self::Consistent,
+        Self::Unrelated,
+        Self::Insufficient,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Contradicts => "contradicts",
+            Self::Consistent => "consistent",
+            Self::Unrelated => "unrelated",
+            Self::Insufficient => "insufficient",
+        }
+    }
+
+    /// Returns `None` for a value that is not a decision.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|decision| decision.as_str() == value)
+    }
+}
+
+/// The probabilities of the four decision options for one (claim, passage) pair.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecisionScores {
+    pub contradicts: f32,
+    pub consistent: f32,
+    pub unrelated: f32,
+    pub insufficient: f32,
+}
+
+impl DecisionScores {
+    /// The option with the highest probability, and that probability. A tie goes to the
+    /// first option in [`Decision::ALL`] order.
+    pub fn best(&self) -> (Decision, f32) {
+        let scores = [
+            self.contradicts,
+            self.consistent,
+            self.unrelated,
+            self.insufficient,
+        ];
+        let mut best = (Decision::Contradicts, scores[0]);
+        for (decision, score) in Decision::ALL.into_iter().zip(scores).skip(1) {
+            if score > best.1 {
+                best = (decision, score);
+            }
+        }
+        best
+    }
+}
+
+/// The level after the decision step. A conflict stays a conflict only when the decision is
+/// [`Decision::Contradicts`] at or above [`DECISION_MIN`]. Else it is a check.
+pub fn confirm(level: SuggestionLevel, scores: DecisionScores) -> SuggestionLevel {
+    // A score that is not a finite number means a failed model call: it gives no conflict.
+    let finite = [
+        scores.contradicts,
+        scores.consistent,
+        scores.unrelated,
+        scores.insufficient,
+    ]
+    .iter()
+    .all(|score| score.is_finite());
+    if !finite {
+        return SuggestionLevel::Check;
+    }
+    match (level, scores.best()) {
+        (SuggestionLevel::Conflict, (Decision::Contradicts, p)) if p >= DECISION_MIN => {
+            SuggestionLevel::Conflict
+        }
+        _ => SuggestionLevel::Check,
+    }
+}
 
 /// The probabilities of the three NLI labels for one (premise, hypothesis) pair.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,8 +240,108 @@ pub fn decide(scores: NliScores) -> Option<SuggestionLevel> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NliScores, decide};
+    use super::{DECISION_MIN, Decision, DecisionScores, NliScores, confirm, decide};
     use crate::store::SuggestionLevel;
+
+    fn decision(contradicts: f32, consistent: f32, unrelated: f32) -> DecisionScores {
+        DecisionScores {
+            contradicts,
+            consistent,
+            unrelated,
+            insufficient: 1.0 - contradicts - consistent - unrelated,
+        }
+    }
+
+    #[test]
+    fn the_best_decision_is_the_most_probable_option() {
+        assert_eq!(decision(0.7, 0.1, 0.1).best(), (Decision::Contradicts, 0.7));
+        assert_eq!(decision(0.1, 0.6, 0.2).best().0, Decision::Consistent);
+        assert_eq!(decision(0.1, 0.1, 0.5).best().0, Decision::Unrelated);
+        assert_eq!(decision(0.1, 0.1, 0.1).best().0, Decision::Insufficient);
+    }
+
+    #[test]
+    fn a_decision_reads_back_from_its_text() {
+        for decision in Decision::ALL {
+            assert_eq!(Decision::parse(decision.as_str()), Some(decision));
+        }
+        assert_eq!(Decision::parse("contradiction"), None);
+    }
+
+    #[test]
+    fn a_conflict_stays_a_conflict_when_the_decision_contradicts_with_enough_probability() {
+        let level = confirm(SuggestionLevel::Conflict, decision(0.60, 0.2, 0.1));
+
+        assert_eq!(level, SuggestionLevel::Conflict);
+    }
+
+    #[test]
+    fn a_conflict_becomes_a_check_when_the_contradiction_is_not_probable_enough() {
+        let level = confirm(SuggestionLevel::Conflict, decision(0.59, 0.2, 0.1));
+
+        assert_eq!(level, SuggestionLevel::Check);
+    }
+
+    #[test]
+    fn a_conflict_becomes_a_check_when_an_other_option_is_best() {
+        // Abstain.
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, decision(0.30, 0.0, 0.0)),
+            SuggestionLevel::Check
+        );
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, decision(0.1, 0.8, 0.05)),
+            SuggestionLevel::Check
+        );
+    }
+
+    #[test]
+    fn the_decision_minimum_is_the_edge_of_a_conflict() {
+        let at = decision(DECISION_MIN, 0.2, 0.1);
+        let below = decision(DECISION_MIN.next_down(), 0.2, 0.1);
+
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, at),
+            SuggestionLevel::Conflict
+        );
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, below),
+            SuggestionLevel::Check
+        );
+        assert_eq!(
+            confirm(SuggestionLevel::Conflict, decision(1.0, 0.0, 0.0)),
+            SuggestionLevel::Conflict
+        );
+    }
+
+    #[test]
+    fn scores_that_are_not_finite_never_give_a_conflict() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let in_contradicts = DecisionScores {
+                contradicts: bad,
+                ..decision(0.9, 0.05, 0.05)
+            };
+            let in_other = DecisionScores {
+                consistent: bad,
+                ..decision(0.9, 0.05, 0.05)
+            };
+
+            for scores in [in_contradicts, in_other] {
+                assert_eq!(
+                    confirm(SuggestionLevel::Conflict, scores),
+                    SuggestionLevel::Check,
+                    "{scores:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_check_stays_a_check_even_when_the_decision_contradicts() {
+        let level = confirm(SuggestionLevel::Check, decision(0.95, 0.02, 0.02));
+
+        assert_eq!(level, SuggestionLevel::Check);
+    }
 
     fn scores(entailment: f32, contradiction: f32) -> NliScores {
         NliScores {

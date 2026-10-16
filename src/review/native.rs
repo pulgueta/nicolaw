@@ -1,9 +1,10 @@
 //! The real analysis models with candle: mDeBERTa-v3 NLI and Qwen3 4B (GGUF, Q4_K_M). Each
-//! model has its own thread, which loads the model and serves the calls.
+//! model has its own thread, which loads the model and serves the calls. The language model
+//! and the decision step share the one Qwen3 thread.
 
 use std::fs::{self, File};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use candle_core::quantized::gguf_file;
@@ -14,8 +15,10 @@ use candle_transformers::models::debertav2::{Config, DebertaV2SeqClassificationM
 use candle_transformers::models::quantized_qwen3::ModelWeights;
 use tokenizers::{Tokenizer, TruncationParams};
 
-use super::prompt::{claims_prompt, explain_prompt, json_end};
-use super::{Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError};
+use super::prompt::{claims_prompt, decision_prompt, explain_prompt, json_end};
+use super::{
+    Decider, Decision, DecisionScores, Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError,
+};
 
 /// The NLI model reads at most this number of tokens for a pair.
 const NLI_MAX_TOKENS: usize = 512;
@@ -38,14 +41,16 @@ impl ReviewBackend for NativeReview {
             .and_then(|path| Tokenizer::from_file(path).ok())
             .ok_or(ReviewError::ModelLoad)?;
         tokenizer.with_truncation(None).map_err(load_error)?;
+        let qwen = Arc::new(ModelThread::spawn("nicolaw-llm", move || {
+            Qwen::load(&llm, device())
+        })?);
         Ok(Engines {
             nli: Box::new(NativeNli {
                 thread: ModelThread::spawn("nicolaw-nli", move || Deberta::load(&nli, device()))?,
                 tokenizer,
             }),
-            llm: Box::new(NativeLlm(ModelThread::spawn("nicolaw-llm", move || {
-                Qwen::load(&llm, device())
-            })?)),
+            llm: Box::new(NativeLlm(qwen.clone())),
+            decider: Box::new(NativeDecider(qwen)),
         })
     }
 }
@@ -58,7 +63,7 @@ type Call<M> = Box<dyn FnOnce(&mut M) + Send>;
 
 /// One model on its own thread. The thread loads the model, so the model does not need to be
 /// `Send`. Drop stops the thread and waits for it, so that the model is free before the
-/// process exits.
+/// process exits. A shared thread (in an `Arc`) stops when its last user drops it.
 struct ModelThread<M> {
     /// `None` only during drop.
     calls: Option<mpsc::Sender<Call<M>>>,
@@ -151,7 +156,22 @@ impl Nli for NativeNli {
     }
 }
 
-struct NativeLlm(ModelThread<Qwen>);
+/// The probabilities of the options from their logits, in [`Decision::ALL`] order: a softmax
+/// over these four values only.
+fn option_scores(logits: [f32; 4]) -> DecisionScores {
+    let max = logits.into_iter().fold(f32::NEG_INFINITY, f32::max);
+    let exp = logits.map(|logit| (logit - max).exp());
+    let sum: f32 = exp.iter().sum();
+    let [contradicts, consistent, unrelated, insufficient] = exp.map(|value| value / sum);
+    DecisionScores {
+        contradicts,
+        consistent,
+        unrelated,
+        insufficient,
+    }
+}
+
+struct NativeLlm(Arc<ModelThread<Qwen>>);
 
 impl Llm for NativeLlm {
     fn claims(&mut self, question: Option<&str>, statement: &str) -> Result<String, ReviewError> {
@@ -162,6 +182,16 @@ impl Llm for NativeLlm {
     fn explain(&mut self, claim: &str, passage: &str) -> Result<String, ReviewError> {
         let prompt = explain_prompt(claim, passage);
         self.0.call(move |model| model.answer(&prompt, "{"))?
+    }
+}
+
+/// The decision step on the shared Qwen3 thread: option-logit scoring, no text generation.
+struct NativeDecider(Arc<ModelThread<Qwen>>);
+
+impl Decider for NativeDecider {
+    fn decide(&mut self, claim: &str, passage: &str) -> Result<DecisionScores, ReviewError> {
+        let prompt = decision_prompt(claim, passage);
+        self.0.call(move |model| model.decide(&prompt))?
     }
 }
 
@@ -251,6 +281,9 @@ struct Qwen {
     device: Device,
     /// The tokens that end an answer.
     stop: Vec<u32>,
+    /// The first token of each decision label with a leading space, in [`Decision::ALL`]
+    /// order.
+    labels: [u32; 4],
 }
 
 impl Qwen {
@@ -267,12 +300,49 @@ impl Qwen {
             .iter()
             .filter_map(|token| tokenizer.token_to_id(token))
             .collect();
+        let mut labels = [0; 4];
+        for (slot, decision) in labels.iter_mut().zip(Decision::ALL) {
+            // The prompt ends with "Decision:", so the label comes after a space.
+            let encoding = tokenizer
+                .encode(format!(" {}", decision.as_str()), false)
+                .map_err(load_error)?;
+            *slot = *encoding.get_ids().first().ok_or(ReviewError::ModelLoad)?;
+        }
+        // Two labels with the same first token cannot be told apart.
+        if (1..4).any(|i| labels[..i].contains(&labels[i])) {
+            return Err(ReviewError::ModelLoad);
+        }
         Ok(Self {
             weights,
             tokenizer,
             device,
             stop,
+            labels,
         })
+    }
+
+    /// Scores the decision options after `prompt` ([`decision_prompt`]): one forward pass, the
+    /// logit of the first token of each label, and a softmax over these four logits only.
+    fn decide(&mut self, prompt: &str) -> Result<DecisionScores, ReviewError> {
+        self.weights.clear_kv_cache();
+        let prompt = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(inference_error)?
+            .get_ids()
+            .to_vec();
+        let logits = Tensor::new(prompt.as_slice(), &self.device)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .and_then(|tensor| self.weights.forward(&tensor, 0))
+            .and_then(|logits| logits.squeeze(0))
+            .and_then(|logits| logits.to_dtype(DType::F32))
+            .and_then(|logits| logits.to_vec1::<f32>())
+            .map_err(inference_error)?;
+        let mut options = [0.0; 4];
+        for (option, token) in options.iter_mut().zip(self.labels) {
+            *option = *logits.get(token as usize).ok_or(ReviewError::Inference)?;
+        }
+        Ok(option_scores(options))
     }
 
     /// Generates the answer to `prompt`, which ends with `start`. Returns `start` and the
@@ -323,10 +393,23 @@ impl Qwen {
 
 #[cfg(test)]
 mod tests {
-    use super::{Deberta, NativeReview, Qwen, device};
+    use super::{Deberta, NativeReview, Qwen, device, option_scores};
     use crate::models::{self, LLM, ModelDirs, NLI};
     use crate::review::ReviewBackend;
     use crate::review::parse::{parse_claims, parse_explanation};
+
+    #[test]
+    fn option_scores_are_a_softmax_over_the_four_logits() {
+        let scores = option_scores([2.0, 0.0, 0.0, 0.0]);
+
+        let sum = scores.contradicts + scores.consistent + scores.unrelated + scores.insufficient;
+        assert!((sum - 1.0).abs() < 1e-6, "{scores:?}");
+        // e^2 / (e^2 + 3)
+        assert!((scores.contradicts - 0.711_235).abs() < 1e-5, "{scores:?}");
+        assert_eq!(scores.consistent, scores.insufficient);
+        // Large logits do not overflow.
+        assert!((option_scores([1000.0, 1000.0, 0.0, 0.0]).consistent - 0.5).abs() < 1e-6);
+    }
 
     fn files(model: &models::AnalysisModel) -> Vec<std::path::PathBuf> {
         models::find_files(&ModelDirs::system(), model)
@@ -429,6 +512,170 @@ mod tests {
         );
     }
 
+    /// Scores the decision options of a Spanish contradiction, a consistent pair, an unrelated
+    /// pair, and a pair with too little information, with the installed language model. Each
+    /// pair must get its label, and the four scores must be finite and sum to 1. This is a
+    /// check of four examples, not a calibration (see `real_calibration_pairs_report`):
+    ///
+    /// ```sh
+    /// cargo test real_decider -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the installed language model"]
+    fn real_decider_labels_spanish_pairs() {
+        use crate::review::Decision;
+        use crate::review::prompt::decision_prompt;
+
+        let mut model = Qwen::load(&files(&LLM), device()).unwrap();
+        let claim = "El acusado estaba en Bogotá el 12 de marzo de 2024.";
+        let pairs = [
+            (
+                Decision::Contradicts,
+                "Según el registro del hotel, el 12 de marzo de 2024 el acusado estaba en \
+                 Medellín y no estuvo en Bogotá.",
+            ),
+            (
+                Decision::Consistent,
+                "El 12 de marzo de 2024 el acusado almorzó en un restaurante de Bogotá.",
+            ),
+            (
+                Decision::Unrelated,
+                "El testigo vio un carro rojo frente a la casa.",
+            ),
+            (
+                Decision::Insufficient,
+                "El acusado llegó a Bogotá en marzo de 2024, pero el registro no dice el \
+                 día.",
+            ),
+        ];
+        let mut labels = Vec::new();
+        for (expected, passage) in pairs {
+            let started = std::time::Instant::now();
+            let decision = model.decide(&decision_prompt(claim, passage)).unwrap();
+            println!(
+                "{expected:?} ({:?}): {decision:?} best={:?}",
+                started.elapsed(),
+                decision.best()
+            );
+            let all = [
+                decision.contradicts,
+                decision.consistent,
+                decision.unrelated,
+                decision.insufficient,
+            ];
+            assert!(all.iter().all(|p| p.is_finite()), "{decision:?}");
+            let sum: f32 = all.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-3, "sum {sum}");
+            labels.push((expected, decision.best().0));
+        }
+
+        for (expected, best) in labels {
+            assert_eq!(best, expected);
+        }
+    }
+
+    /// One labeled pair of the calibration set: claim, passage, label, family.
+    type Pair = (String, String, crate::review::Decision, String);
+
+    /// Reads a calibration file (see `tests/fixtures/calibration/README.md`).
+    fn calibration_pairs(text: &str) -> Vec<Pair> {
+        text.lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let [claim, passage, label, family] = fields[..] else {
+                    panic!("not 4 fields: {line}");
+                };
+                let label = crate::review::Decision::parse(label)
+                    .unwrap_or_else(|| panic!("unknown label: {label}"));
+                (claim.into(), passage.into(), label, family.into())
+            })
+            .collect()
+    }
+
+    fn seed_pairs() -> Vec<Pair> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/calibration/seed.tsv");
+        calibration_pairs(&std::fs::read_to_string(path).unwrap())
+    }
+
+    #[test]
+    fn the_calibration_seed_has_six_families_with_each_label() {
+        use crate::review::Decision;
+
+        let pairs = seed_pairs();
+
+        assert_eq!(pairs.len(), 24);
+        let mut families: Vec<&str> = pairs.iter().map(|pair| pair.3.as_str()).collect();
+        families.sort();
+        families.dedup();
+        assert_eq!(families.len(), 6);
+        for family in families {
+            for label in Decision::ALL {
+                assert_eq!(
+                    pairs
+                        .iter()
+                        .filter(|pair| pair.3 == family && pair.2 == label)
+                        .count(),
+                    1,
+                    "{family} {label:?}"
+                );
+            }
+        }
+    }
+
+    /// Scores the calibration seed with the installed models, and prints each pair and a
+    /// confusion table of the decision step. It does not check accuracy: the seed is too small.
+    ///
+    /// ```sh
+    /// cargo test real_calibration_pairs_report -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the installed analysis models"]
+    fn real_calibration_pairs_report() {
+        use crate::review::Decision;
+        use crate::review::prompt::decision_prompt;
+
+        let pairs = seed_pairs();
+        let nli = Deberta::load(&files(&NLI), device()).unwrap();
+        let mut qwen = Qwen::load(&files(&LLM), device()).unwrap();
+        // confusion[label][decision]
+        let mut confusion = [[0u32; 4]; 4];
+        let index = |decision: Decision| {
+            Decision::ALL
+                .iter()
+                .position(|&other| other == decision)
+                .unwrap()
+        };
+        println!("family\tlabel\tdecision\tscore\tnli_contradiction\tclaim");
+        for (claim, passage, label, family) in &pairs {
+            let scores = nli
+                .score(passage, claim)
+                .unwrap()
+                .max(nli.score(claim, passage).unwrap());
+            let (decision, score) = qwen
+                .decide(&decision_prompt(claim, passage))
+                .unwrap()
+                .best();
+            confusion[index(*label)][index(decision)] += 1;
+            println!(
+                "{family}\t{}\t{}\t{score:.3}\t{:.3}\t{claim}",
+                label.as_str(),
+                decision.as_str(),
+                scores.contradiction
+            );
+        }
+        println!("\nlabel \\ decision\tcontradicts\tconsistent\tunrelated\tinsufficient");
+        for (label, row) in Decision::ALL.iter().zip(confusion) {
+            println!(
+                "{}\t{}",
+                label.as_str(),
+                row.map(|count| count.to_string()).join("\t")
+            );
+        }
+    }
+
     /// Runs the full analysis with the real models: a hearing answer of the accused against a
     /// hotel register in the case.
     ///
@@ -497,11 +744,13 @@ mod tests {
         for event in &events {
             match event {
                 ReviewEvent::SuggestionAdded(s) => println!(
-                    "{:?} {:?} p(contradiction)={:.3}\n  claim: {}\n  claim quote: {:?}\n  \
-                     evidence: {} (página {}): {}\n  explanation: {:?}",
+                    "{:?} {:?} p(contradiction)={:.3} decision={:?} p={:?}\n  claim: {}\n  \
+                     claim quote: {:?}\n  evidence: {} (página {}): {}\n  explanation: {:?}",
                     s.level,
                     s.kind,
                     s.nli_contradiction,
+                    s.decision,
+                    s.decision_p,
                     s.claim,
                     s.claim_quote,
                     s.evidence_name,
@@ -519,7 +768,8 @@ mod tests {
         );
     }
 
-    /// Loads both models through the backend, as the app does.
+    /// Loads both models through the backend, as the app does, and uses the NLI model and the
+    /// decision step.
     ///
     /// ```sh
     /// cargo test -- --ignored --nocapture real_backend
@@ -538,6 +788,15 @@ mod tests {
             .unwrap();
 
         println!("scores: {scores:?}");
+        // The language model and the decision step share one Qwen3 thread.
+        let decision = engines
+            .decider
+            .decide(
+                "El acusado estaba en Bogotá.",
+                "El acusado estaba en Medellín.",
+            )
+            .unwrap();
+        println!("decision: {decision:?}");
         drop(engines);
     }
 }

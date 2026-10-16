@@ -1,0 +1,61 @@
+# Feature: jev-style-decision
+
+Locator: `odd/tasks/jev-style-decision.md`
+Engram mirror: `odd/jev-style-decision/tasks`
+
+## Objective
+
+Add a local Jev-style decision step to the discrepancy analysis, as layer 4 of the stack (`classification` on top of `analysis`, PR against `analysis`).
+
+## Problem
+
+The user asked for Jev (TypeSafe AI) as the classifier. Jev is proprietary and API-only. The app must run fully local. Layer 3 uses mDeBERTa NLI for scoring and the LLM `explain` JSON for a yes/no agreement. The yes/no in generated JSON has no probability and no abstain option.
+
+## Research (2026-10-15, primary sources)
+
+- Jev: discriminative "System One" API (`state` + typed questions `noul`/`choice`/`score`, each option with a description, probabilities per option). Weights not published. Source: https://developers.cloudflare.com/ai/models/typesafe/jev/
+- Cloudflare Clef (27B) and Clef-flash (9B), 2026-10-01, Apache-2.0: same System One API with a joint schema head. Not loadable in candle (no `qwen3_5` module, no head). Published language list says English only. Sources: https://developers.cloudflare.com/changelog/post/2026-10-01-clef-workers-ai/ , https://huggingface.co/Cloudflare/clef-flash
+- Other candidates (Julia-1, Kev-4B, OpenJev, Horizon-Labs zeroshot, GLiClass) have no Spanish NLI result, no candle support, or a non-commercial license.
+- mDeBERTa-v3 multilingual NLI stays the primary scorer: XNLI-es 0.832, MIT, 3-way labels, candle `debertav2`.
+
+## Decision
+
+- Keep mDeBERTa as the first stage. Add a second stage that follows Jev's `choice` question shape, run on the Qwen3-4B that candle already loads:
+  - State: the evidence passage and the claim. Question: one `choice` with four described options: `contradicts`, `consistent`, `unrelated`, `insufficient` (abstain).
+  - No text generation. One forward pass over the prompt that ends where the answer starts; read the logit of the first token of each option label; softmax over only those four logits. This is how Jev and Clef produce probabilities (one logit per option).
+  - Cascade: the decision runs only on pairs that mDeBERTa already flagged. A pair is a `conflict` only when NLI says conflict, the decision is `contradicts` with probability at or above `DECISION_MIN` (0.60 initial, tune on real data), and the explanation JSON agrees. Otherwise it is a `check`.
+  - The decision label and probability are stored with the suggestion and shown in the panel, so the lawyer sees `insuficiente` as an abstain.
+- Clef-flash through an MLX or llama.cpp sidecar is not added: no Rust path, English-only language list, no Spanish evaluation.
+
+## Constraints
+
+- Same as `nicolaw-v1-stack`: gpui-kit 0.7.3 components, Spanish UI copy, English code and docs, strict TDD with `cargo test`, checks `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo build`. `cargo clean` at the end.
+- Evidence and transcript text are data in prompts, never instructions. Reuse the `RESERVED` guard in `src/review/prompt.rs`.
+- No new model download. No new crate unless candle needs one.
+
+## Delivery
+
+- Strategy: `auto-chain`, `stacked-to-main`. One branch `classification`, one PR with base `analysis`.
+- Forecast: about 700 authored changed lines.
+
+## Tasks
+
+- [x] T1 `Decision` trait, `DecisionScores`, fake, `decide_with` rule (NLI level + decision), thresholds, store schema v5 (`decision TEXT`, `decision_p REAL` on `suggestions`), analyzer cascade. Route: delegated writer (opus).
+- [x] T2 Native option-logit scoring on the loaded Qwen3 in `src/review/native.rs` (shared model thread), prompt in `src/review/prompt.rs`, ignored real-model test. Same writer.
+- [x] T3 Panel shows the decision label and probability in Spanish; README "Analysis" section updated with the Jev comparison summary. Same writer.
+- [x] T4 Spot check, `gh stack submit --auto --open`, `cargo clean`, PR body with research summary. Route: inline.
+
+## Progress and evidence
+
+- Branch `classification` created with `gh stack add classification` on top of `analysis`.
+- T1 done: `851cb3d feat(review): add jev-style decision stage`. `Decider` trait, `Decision`, `DecisionScores::best`, `DECISION_MIN = 0.60`, `confirm`, `FakeDecider`, analyzer cascade (NLI flag, then decision, then explanation), schema v5 (`decision TEXT`, `decision_p REAL`, nullable) with a v4 migration test. `src/app.rs` test literal added to the surface with approval. RED observed for `confirm` (2 tests), the store round trip (1 test), and the analyzer cascade (3 tests); then GREEN.
+- T2 done: `d384fe1 feat(review): score decisions by option logits on qwen3`. `decision_prompt` returns `String` (accepted deviation: the `RESERVED` guard removes text and cannot fail). The prompt ends with `Decision:`; the labels with a leading space start with distinct tokens (` contr` 6027, ` consistent` 12966, ` unrelated` 45205, ` insufficient` 38313); load fails if two first tokens are equal. One Qwen thread is shared through `Arc<ModelThread<Qwen>>`. RED observed for the prompt test and the softmax test; then GREEN.
+- T2 real model (`cargo test real_decider -- --ignored --nocapture`, Metal): contradiction pair best `Contradicts` p=1.0; consistent pair best `Consistent` p=1.0; unrelated pair best `Unrelated` p=0.9999996; about 0.7 s each. The probabilities are saturated (not calibrated); tune `DECISION_MIN` on labeled data. `real_pipeline` passed: one `Conflict` with `Contradicts` p=0.999, one `Check` with `Consistent` p=0.979. `real_backend` passed with the shared thread.
+- T3 done: `9b15dc8 feat(app): show decision in suggestions panel`. Spanish `Tag` under the level row (`Contradice · 92 %`, `Compatible`, `No relacionada`, `Insuficiente`), nothing when NULL; README "Analysis" with step 4 and "Why not Jev". RED observed for the label test and the view test; then GREEN.
+- Checks after T3: `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0; `cargo test` 163 passed, 0 failed, 8 ignored; `cargo build` exit 0.
+- Next step: T4 (parent): spot check, `gh stack submit --auto --open`, `cargo clean`, PR body.
+- T4: PR #5 https://github.com/pulgueta/nicolaw/pull/5 (base `analysis`), ready for review. Parent spot check on `classification`: `cargo test` 163 passed, 8 ignored before the review fixes; 182 passed, 8 ignored after the stack rebase with the Codex fixes. `cargo clean` ran twice.
+- Review fixes (2026-10-15): 16 Codex findings fixed bottom-up on `foundation` (4eb98a1, b4b0899, a33742c, f16e777, 1b90807), `transcription` (104689d, 7568cad, ebdc9de), `analysis` (f2b7675, fe56208); stack rebased with `--no-trunk`, pushed, and each comment answered.
+- Open: `pipeline::refine()` skips `finish()` on a feed error (same shape as finding 6). `DECISION_MIN` needs calibration data.
+- QA round 1 fixes (2026-10-16): the card says `Puntuación del modelo; no calibrada.` beside the score; conflict copy `Posible discrepancia. Revise la fuente.`, abstain copy `Información insuficiente. Revise el contexto.`, Confirmar shows `Marcada por usted`. `confirm` gives no conflict for a score that is not finite. `real_decider_labels_spanish_pairs` asserts all four labels, finite scores, and a sum of 1 (observed: each label correct; the first insufficient passage, an illegible register page, got `unrelated` 0.92, so the test uses a partial-information passage).
+- Calibration seed (`tests/fixtures/calibration/seed.tsv`, 24 synthetic pairs, 6 families): `real_calibration_pairs_report` decision confusion (rows label, columns decision: contradicts, consistent, unrelated, insufficient): contradicts 5/1/0/0, consistent 0/6/0/0, unrelated 0/0/6/0, insufficient 1/4/1/0. The decision step never abstained, and 4 of 6 insufficient pairs got `consistent` at a score of 1.000. Most scores are saturated at 1.000. `DECISION_MIN` stays an initial value until the 240-pair plan in the README runs.

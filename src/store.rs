@@ -395,6 +395,8 @@ pub struct Suggestion {
     pub chunk_id: i64,
     pub evidence_id: i64,
     pub evidence_name: String,
+    /// The type of the evidence file, for its locator label (page or section).
+    pub evidence_mime: String,
     pub page: u32,
     pub claim: String,
     pub claim_quote: Option<String>,
@@ -501,7 +503,7 @@ const SELECT_EVIDENCE: &str = "SELECT e.id, e.name, e.mime, e.size, e.sha256, \
 
 const SELECT_SUGGESTION: &str = "SELECT s.id, s.hearing_id, s.segment_id, s.chunk_id, \
      c.evidence_id, e.name, c.page, s.claim, s.claim_quote, s.evidence_quote, s.kind, s.level, \
-     s.nli_contradiction, s.explanation, s.status, s.segment_revision \
+     s.nli_contradiction, s.explanation, s.status, s.segment_revision, e.mime \
      FROM suggestions s JOIN chunks c ON c.id = s.chunk_id JOIN evidence e ON e.id = c.evidence_id";
 
 const SELECT_SEGMENT: &str =
@@ -1447,6 +1449,7 @@ fn row_to_suggestion(row: &rusqlite::Row) -> rusqlite::Result<Suggestion> {
         explanation: row.get(13)?,
         status: SuggestionStatus::parse(&row.get::<_, String>(14)?),
         segment_revision: row.get(15)?,
+        evidence_mime: row.get(16)?,
     })
 }
 

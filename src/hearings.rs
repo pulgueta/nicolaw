@@ -4,7 +4,7 @@
 //! window and the quit can complete it.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +21,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Placement, Sizable as _, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
@@ -41,7 +42,7 @@ use crate::review::analyzer::{self, Analyzer, Job, JobQueue, ModelGate, text_has
 use crate::review::{ReviewBackend, ReviewError, ReviewEvent};
 use crate::store::{
     AnalysisState, Hearing, Segment, Speaker, Store, Suggestion, SuggestionCounts, SuggestionKind,
-    SuggestionLevel, SuggestionStatus,
+    SuggestionLevel, SuggestionStatus, locator_label,
 };
 
 actions!(
@@ -52,9 +53,22 @@ actions!(
         /// Pauses or continues the live recording.
         TogglePause,
         /// Changes the speaker of the next speech.
-        SwitchSpeaker
+        SwitchSpeaker,
+        /// Opens the suggestions drawer of a narrow window.
+        OpenSuggestions,
+        /// Closes the suggestions drawer.
+        CloseSuggestions
     ]
 );
+
+/// The key context of the suggestions drawer, for Escape.
+const DRAWER_CONTEXT: &str = "SuggestionsDrawer";
+/// The key context of the button that opens the drawer.
+const TRIGGER_CONTEXT: &str = "SuggestionsTrigger";
+/// The width of the suggestions panel, and of the drawer in a narrow window.
+const PANEL_WIDTH: f32 = 360.;
+/// An evidence passage longer than this many characters shows its start first.
+const SHORT_QUOTE: usize = 240;
 
 const LIST_ERROR: &str = "Nicolaw no puede leer las audiencias.";
 const CREATE_ERROR: &str = "Nicolaw no puede crear la audiencia. Intente de nuevo.";
@@ -114,6 +128,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-r", StartRecording, None),
         KeyBinding::new("cmd-shift-p", TogglePause, None),
         KeyBinding::new("cmd-shift-a", SwitchSpeaker, None),
+        KeyBinding::new("escape", CloseSuggestions, Some(DRAWER_CONTEXT)),
+        KeyBinding::new("enter", OpenSuggestions, Some(TRIGGER_CONTEXT)),
+        KeyBinding::new("space", OpenSuggestions, Some(TRIGGER_CONTEXT)),
     ]);
 }
 
@@ -1264,6 +1281,14 @@ pub struct HearingsView {
     counts: SuggestionCounts,
     /// The analysis state of each segment of the accused in the selected hearing.
     analysis_states: HashMap<i64, AnalysisState>,
+    /// The suggestions whose full evidence passage shows.
+    full_quotes: HashSet<i64>,
+    /// True while the suggestions drawer of a narrow window is open.
+    suggestions_open: bool,
+    /// The button that opens the drawer, and the drawer. Escape gives the focus back to the
+    /// button.
+    trigger_focus: FocusHandle,
+    drawer_focus: FocusHandle,
     filter_select: Entity<SelectState<Vec<FilterItem>>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -1342,6 +1367,10 @@ impl HearingsView {
             suggestions: Vec::new(),
             counts: SuggestionCounts::default(),
             analysis_states: HashMap::new(),
+            full_quotes: HashSet::new(),
+            suggestions_open: false,
+            trigger_focus: cx.focus_handle(),
+            drawer_focus: cx.focus_handle(),
             filter_select,
             _subscriptions: subscriptions,
         };
@@ -1403,6 +1432,7 @@ impl HearingsView {
         self.suggestions.clear();
         self.counts = SuggestionCounts::default();
         self.analysis_states.clear();
+        self.full_quotes.clear();
     }
 
     fn on_recording(&mut self, event: RecordingEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2569,6 +2599,23 @@ impl HearingsView {
         });
     }
 
+    /// Opens the suggestions drawer over the transcript, and moves the focus into it.
+    fn open_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.suggestions_open = true;
+        window.focus(&self.drawer_focus, cx);
+        cx.notify();
+    }
+
+    /// Closes the suggestions drawer, and gives the focus back to its button.
+    fn close_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.suggestions_open {
+            return;
+        }
+        self.suggestions_open = false;
+        window.focus(&self.trigger_focus, cx);
+        cx.notify();
+    }
+
     /// The new hearing button and the hearing rows. In the drawer, a selection closes it.
     fn render_list_body(&self, view: WeakEntity<Self>, drawer: bool, cx: &App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
@@ -2740,6 +2787,34 @@ impl HearingsView {
                         cx.notify();
                     })),
             )
+            .children(hearing.filter(|_| narrow).map(|_| {
+                let open = self.counts.conflict + self.counts.check;
+                // The wrapper has the focus, so that Escape in the drawer gives it back.
+                div()
+                    .id("suggestions-trigger")
+                    .flex_none()
+                    .rounded(cx.theme().radius)
+                    .track_focus(&self.trigger_focus)
+                    .tab_stop(true)
+                    .key_context(TRIGGER_CONTEXT)
+                    .on_action(cx.listener(|this, _: &OpenSuggestions, window, cx| {
+                        this.open_suggestions(window, cx)
+                    }))
+                    .focus_visible(|style| style.bg(cx.theme().accent))
+                    .child(
+                        Button::new("suggestions-drawer")
+                            .outline()
+                            .small()
+                            .tab_stop(false)
+                            .label(format!("Sugerencias ({open})"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_suggestions(window, cx)
+                                }),
+                            ),
+                    )
+                    .test_support()
+            }))
             .children(hearing.map(|hearing| {
                 Button::new("delete-hearing")
                     .ghost()
@@ -3163,8 +3238,9 @@ impl HearingsView {
 
 impl HearingsView {
     /// The suggestions panel: counters, the live analysis switch, the analysis models, the
-    /// filter, and the cards.
-    fn render_suggestions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// filter, and the cards. Only the cards scroll. In a narrow window, the panel is the
+    /// content of the drawer, with a close button.
+    fn render_suggestions(&self, drawer: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let installed = self.analysis_files().is_some();
         let filter = self.filter(cx);
@@ -3172,7 +3248,7 @@ impl HearingsView {
             .suggestions
             .iter()
             .filter(|suggestion| filter.matches(suggestion.status))
-            .map(|suggestion| self.render_card(suggestion, cx))
+            .map(|suggestion| self.render_card(suggestion, drawer, cx))
             .collect();
         let empty = cards.is_empty().then(|| {
             let text = if self.suggestions.is_empty() || filter == Filter::Open {
@@ -3243,8 +3319,22 @@ impl HearingsView {
             .review
             .as_ref()
             .is_some_and(|review| review.task.is_none());
+        // "La grabación continúa" only when the capture of this hearing is healthy.
+        let recording = self.recording.read(cx).live();
+        let live = recording.is_some_and(|live| Some(live.hearing_id) == self.selected);
+        let capture_ok = recording.is_some_and(|live| live.health == Health::Ok && !live.paused);
         let status = if loading {
-            Some("Nicolaw carga los modelos de análisis.".to_owned())
+            Some(if capture_ok {
+                "Cargando análisis. La grabación continúa.".to_owned()
+            } else {
+                "Cargando análisis.".to_owned()
+            })
+        } else if live && !self.analysis_on() {
+            Some(if capture_ok {
+                "Análisis desactivado. La grabación continúa.".to_owned()
+            } else {
+                "Análisis desactivado.".to_owned()
+            })
         } else if self.review_pending > 0 {
             Some(format!(
                 "Declaraciones en análisis: {}",
@@ -3260,36 +3350,42 @@ impl HearingsView {
             )
         });
 
+        let close = drawer.then(|| {
+            Button::new("suggestions-close")
+                .ghost()
+                .small()
+                .icon(IconName::Close)
+                .tooltip("Cerrar")
+                .on_click(cx.listener(|this, _, window, cx| this.close_suggestions(window, cx)))
+        });
+
         v_flex()
             .id("suggestions-panel")
             .flex_none()
-            .w(px(340.))
+            .map(|panel| {
+                if drawer {
+                    panel.w_full()
+                } else {
+                    panel.w(px(PANEL_WIDTH))
+                }
+            })
             .h_full()
             .p_3()
             .gap_3()
-            .border_l_1()
+            .when(!drawer, |panel| panel.border_l_1())
             .border_color(cx.theme().border)
             .test_support()
             .child(
                 h_flex()
+                    .flex_none()
                     .gap_2()
                     .items_center()
-                    .justify_between()
-                    .child(div().font_semibold().child("Sugerencias"))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Tag::danger()
-                                    .small()
-                                    .child(format!("Conflictos: {}", self.counts.conflict)),
-                            )
-                            .child(
-                                Tag::warning()
-                                    .small()
-                                    .child(format!("Revisar: {}", self.counts.check)),
-                            ),
-                    ),
+                    .child(div().flex_1().font_semibold().child("Sugerencias"))
+                    .child(div().flex_none().text_xs().text_color(muted).child(format!(
+                        "Conflictos: {} · Revisar: {}",
+                        self.counts.conflict, self.counts.check
+                    )))
+                    .children(close),
             )
             .child(
                 Switch::new("live-analysis")
@@ -3309,28 +3405,44 @@ impl HearingsView {
             )
             .child(
                 // Without this wrapper, the select grows in the column.
-                div().flex_none().child(
-                    Select::new(&self.filter_select)
-                        .id("suggestion-filter")
-                        .w_full()
-                        .accessibility_label("Filtro de sugerencias"),
-                ),
+                div()
+                    .id("suggestion-filter-box")
+                    .flex_none()
+                    .test_support()
+                    .child(
+                        Select::new(&self.filter_select)
+                            .id("suggestion-filter")
+                            .w_full()
+                            .accessibility_label("Filtro de sugerencias"),
+                    ),
             )
             .child(
-                v_flex()
-                    .id("suggestion-list")
+                div()
+                    .id("suggestion-list-box")
                     .flex_1()
                     .min_h_0()
-                    .gap_3()
-                    .children(cards)
-                    .children(empty)
-                    .overflow_y_scrollbar(),
+                    .w_full()
+                    .test_support()
+                    .child(
+                        v_flex()
+                            .id("suggestion-list")
+                            .size_full()
+                            .gap_3()
+                            .children(cards)
+                            .children(empty)
+                            .overflow_y_scrollbar(),
+                    ),
             )
     }
 
     /// One suggestion: level, kind, the claim with the conflicting words in bold, the
     /// evidence passage with its file and page, the explanation, and the decision buttons.
-    fn render_card(&self, suggestion: &Suggestion, cx: &mut Context<Self>) -> AnyElement {
+    fn render_card(
+        &self,
+        suggestion: &Suggestion,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let id = suggestion.id;
         let level = match suggestion.level {
@@ -3374,6 +3486,54 @@ impl HearingsView {
             page: suggestion.page,
         };
         let label = |text: &'static str| div().text_xs().text_color(muted).child(text);
+        let (quote, short) = if self.full_quotes.contains(&id) {
+            (suggestion.evidence_quote.clone(), false)
+        } else {
+            short_quote(&suggestion.evidence_quote)
+        };
+        // The file name can be cut, the locator never: in a narrow window it has its own line.
+        let name = suggestion.evidence_name.clone();
+        let file = div()
+            .id(("source-name", id as u64))
+            .min_w_0()
+            .truncate()
+            .child(name.clone())
+            .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+            .test_support();
+        let locator = div()
+            .id(("source-locator", id as u64))
+            .flex_none()
+            .child(locator_label(&suggestion.evidence_mime, suggestion.page))
+            .test_support();
+        let open = Button::new(("source", id as u64))
+            .link()
+            .xsmall()
+            .flex_none()
+            .label("Abrir fuente")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // The evidence screen replaces this screen: the drawer is closed on return.
+                this.suggestions_open = false;
+                cx.emit(source)
+            }));
+        let source_row = if narrow {
+            v_flex()
+                .gap_1()
+                .text_xs()
+                .text_color(muted)
+                .child(file)
+                .child(h_flex().gap_2().items_center().child(locator).child(open))
+                .into_any_element()
+        } else {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(file.flex_1())
+                .child(locator)
+                .child(open)
+                .into_any_element()
+        };
 
         v_flex()
             .id(("suggestion", id as u64))
@@ -3400,27 +3560,25 @@ impl HearingsView {
             .child(label("Prueba"))
             .child(
                 div()
+                    .id(("quote", id as u64))
                     .pl_2()
                     .border_l_2()
                     .border_color(cx.theme().border)
                     .text_sm()
-                    .child(format!("«{}»", suggestion.evidence_quote)),
+                    .child(format!("«{quote}»"))
+                    .test_support(),
             )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(
-                        Button::new(("source", id as u64))
-                            .link()
-                            .xsmall()
-                            .label(suggestion.evidence_name.clone())
-                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(source))),
-                    )
-                    .child(format!("· Página {}", suggestion.page)),
-            )
+            .children(short.then(|| {
+                Button::new(("full-quote", id as u64))
+                    .link()
+                    .xsmall()
+                    .label("Ver pasaje completo")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.full_quotes.insert(id);
+                        cx.notify();
+                    }))
+            }))
+            .child(source_row)
             .children(
                 suggestion
                     .explanation
@@ -3527,6 +3685,19 @@ impl HearingsView {
     }
 }
 
+/// The start of a long evidence passage, cut after a word, and true if it was cut.
+fn short_quote(quote: &str) -> (String, bool) {
+    if quote.chars().count() <= SHORT_QUOTE {
+        return (quote.to_owned(), false);
+    }
+    let end = quote
+        .char_indices()
+        .nth(SHORT_QUOTE)
+        .map_or(quote.len(), |(index, _)| index);
+    let cut = quote[..end].rfind(' ').unwrap_or(end);
+    (format!("{}…", quote[..cut].trim_end()), true)
+}
+
 /// The text of an analysis state, for the transcript.
 pub fn analysis_label(state: AnalysisState) -> &'static str {
     match state {
@@ -3605,15 +3776,42 @@ impl Render for HearingsView {
             self.new_text = false;
         }
         let narrow = window.viewport_size().width < px(NARROW_WIDTH);
+        let selected = self.selected_hearing().is_some();
+        // In a narrow window the suggestions are a drawer over the transcript, so that the
+        // transcript keeps its width. The drawer is inside this screen, so it never covers the
+        // live strip above it.
+        let drawer = (narrow && selected && self.suggestions_open).then(|| {
+            div()
+                .id("suggestions-sheet")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .w(px(PANEL_WIDTH))
+                .occlude()
+                .track_focus(&self.drawer_focus)
+                .key_context(DRAWER_CONTEXT)
+                .on_action(cx.listener(|this, _: &CloseSuggestions, window, cx| {
+                    this.close_suggestions(window, cx)
+                }))
+                .bg(cx.theme().background)
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .shadow_lg()
+                .child(self.render_suggestions(true, cx))
+                .test_support()
+        });
         h_flex()
             .id("hearings")
+            .relative()
             .size_full()
             .items_start()
             .when(!narrow, |screen| screen.child(self.render_list(cx)))
             .child(self.render_detail(narrow, cx))
-            .when(self.selected_hearing().is_some(), |screen| {
-                screen.child(self.render_suggestions(cx))
+            .when(selected && !narrow, |screen| {
+                screen.child(self.render_suggestions(false, cx))
             })
+            .children(drawer)
             .test_support()
     }
 }
@@ -5211,6 +5409,18 @@ mod tests {
             )
             .unwrap()
             .id;
+        // The hearing has a suggestion, so that the suggestions are available.
+        let chunk = add_evidence(&store, case, name);
+        let statement = store.insert_segment(id, 0, Speaker::Accused).unwrap();
+        store.finish_segment(statement, ANSWER, 900).unwrap();
+        store
+            .insert_suggestion(&new_suggestion(
+                id,
+                statement,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap();
         let backend = FakeBackend::new("");
         let dirs = model_dirs(name, true);
         let opened = open_sized(
@@ -5282,18 +5492,166 @@ mod tests {
         let strip = bounds(cx, opened.window, "live-strip");
         assert_eq!(strip.size.height, px(if narrow { 80. } else { 48. }));
         assert!(bounds(cx, opened.window, "speaker").size.width >= px(176.));
+        cx.wait_for(opened.window, WAIT, |_, cx| {
+            opened.view.read(cx).counts.conflict == 1
+        })
+        .await;
         let transcript = bounds(cx, opened.window, "transcript-frame");
-        // The suggestions panel has its own narrow layout: this check is for the transcript
-        // without it.
-        let panel = shown(cx, opened.window, "suggestions-panel");
         let reading = if narrow { 600. } else { 664. };
         assert!(
-            (narrow && panel) || transcript.size.width >= px(reading),
+            transcript.size.width >= px(reading),
             "the transcript is {transcript:?}"
         );
         assert!(transcript.size.height > px(0.));
         let message = bounds(cx, opened.window, "hearing-message");
         assert!(message.bottom() <= transcript.top());
+        if !narrow {
+            assert_eq!(
+                bounds(cx, opened.window, "suggestions-panel").size.width,
+                px(360.)
+            );
+            // The title, the counts, the state, and the filter do not scroll; the cards do.
+            let filter = bounds(cx, opened.window, "suggestion-filter-box");
+            assert!(bounds(cx, opened.window, "suggestion-list-box").top() >= filter.bottom());
+            return;
+        }
+
+        // A narrow window: the suggestions are a button, and a drawer over the transcript.
+        assert!(!shown(cx, opened.window, "suggestions-panel"));
+        assert_apart(
+            cx,
+            opened.window,
+            &["hearings-drawer", "suggestions-trigger", "delete-hearing"],
+        );
+        click(cx, opened.window, "suggestions-drawer");
+        cx.run_until_parked();
+        let sheet = bounds(cx, opened.window, "suggestions-sheet");
+        assert_eq!(sheet.size.width, px(360.));
+        assert!(
+            sheet.top() >= strip.bottom(),
+            "the drawer covers the live strip"
+        );
+        assert_eq!(bounds(cx, opened.window, "transcript-frame"), transcript);
+        cx.update_window(opened.window, |_, window, cx| {
+            assert!(opened.view.read(cx).drawer_focus.is_focused(window));
+        })
+        .unwrap();
+
+        cx.simulate_keystrokes(opened.window, "escape");
+        cx.run_until_parked();
+
+        assert!(!shown(cx, opened.window, "suggestions-sheet"));
+        cx.update_window(opened.window, |_, window, cx| {
+            assert!(opened.view.read(cx).trigger_focus.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    /// A hearing with one statement and a suggestion from an evidence file with a long name.
+    fn hearing_with_long_source(store: &Store, case: i64, name: &str) -> (i64, i64, i64) {
+        let path = temp_dir(&format!("long-{name}"))
+            .join("NTC-ISO-IEC-27002-2022 ANEXO TECNICO CONTROLES DE SEGURIDAD.txt");
+        fs::write(&path, "x").unwrap();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let long = format!(
+            "{HOTEL} {}",
+            "El texto sigue con más detalles del registro.".repeat(10)
+        );
+        store
+            .save_analysis(
+                evidence,
+                &[Page {
+                    number: 12,
+                    text: long.clone(),
+                    source: PageSource::Text,
+                }],
+            )
+            .unwrap();
+        let chunk = store.search(case, "registro", 1).unwrap()[0].chunk_id;
+        let (hearing, segment) = add_hearing(store, case);
+        let mut new = new_suggestion(hearing, segment, chunk, SuggestionLevel::Conflict);
+        new.evidence_quote = long;
+        let id = store.insert_suggestion(&new).unwrap().id;
+        (hearing, segment, id)
+    }
+
+    async fn check_source_row(name: &str, width: f32, cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, _, id) = hearing_with_long_source(&store, case, name);
+        let dirs = model_dirs(name, true);
+        let opened = open_sized(
+            name,
+            store,
+            case,
+            &FakeBackend::new(""),
+            &dirs,
+            size(px(width), px(700.)),
+            cx,
+        );
+        let narrow = width < 1000.;
+        cx.wait_for(opened.window, WAIT, |_, cx| opened.view.read(cx).loaded)
+            .await;
+        cx.update_window(opened.window, |_, window, cx| {
+            opened
+                .view
+                .update(cx, |view, cx| view.select(hearing, window, cx))
+        })
+        .unwrap();
+        cx.wait_for(opened.window, WAIT, |_, cx| {
+            opened.view.read(cx).suggestions.len() == 1
+        })
+        .await;
+        if narrow {
+            click(cx, opened.window, "suggestions-drawer");
+        }
+        let id = id as u64;
+        cx.wait_for(opened.window, WAIT, |window, _| {
+            window.try_find(("source-locator", id)).is_some()
+        })
+        .await;
+
+        let card = bounds(cx, opened.window, ("suggestion", id));
+        let file = bounds(cx, opened.window, ("source-name", id));
+        let locator = bounds(cx, opened.window, ("source-locator", id));
+        let open = bounds(cx, opened.window, ("source", id));
+        assert!(locator.right() <= card.right() && locator.left() >= card.left());
+        assert!(open.right() <= card.right());
+        assert!(file.right() <= card.right());
+        assert!(!locator.intersects(&file));
+        if narrow {
+            assert!(
+                locator.top() >= file.bottom(),
+                "the locator has its own line"
+            );
+        }
+        // The locator text is whole: "Sección 12" for a text file.
+        assert!(locator.size.width >= px(40.));
+
+        // The long passage shows its start, and the full passage on request.
+        let short = bounds(cx, opened.window, ("quote", id));
+        click(cx, opened.window, ("full-quote", id));
+        cx.run_until_parked();
+        assert!(!shown(cx, opened.window, ("full-quote", id)));
+        assert!(bounds(cx, opened.window, ("quote", id)).size.height > short.size.height);
+    }
+
+    #[gpui_kit::test]
+    async fn the_source_locator_stays_visible_with_a_long_file_name(cx: &mut TestAppContext) {
+        check_source_row("source-wide", 1280., cx).await;
+    }
+
+    #[gpui_kit::test]
+    async fn the_source_locator_has_its_own_line_in_a_narrow_window(cx: &mut TestAppContext) {
+        check_source_row("source-narrow", 900., cx).await;
+    }
+
+    #[test]
+    fn a_long_quote_is_cut_after_a_word() {
+        let (short, cut) = super::short_quote(&"palabra ".repeat(60));
+        assert!(cut);
+        assert!(short.ends_with("palabra…"), "{short}");
+        assert!(short.chars().count() <= super::SHORT_QUOTE + 1);
+        assert_eq!(super::short_quote(HOTEL), (HOTEL.to_owned(), false));
     }
 
     #[gpui_kit::test]

@@ -116,6 +116,8 @@ pub struct FilesView {
     case_select: Entity<SelectState<Vec<CaseItem>>>,
     screen: Screen,
     hearings: Entity<HearingsView>,
+    /// The case and the hearing of the suggestion whose source the evidence screen shows.
+    source_return: Option<(i64, i64)>,
     /// The live recording. The app owns it, so it continues on every screen and case.
     recording: Entity<Recording>,
     search: Entity<InputState>,
@@ -199,7 +201,9 @@ impl FilesView {
             cx.subscribe_in(
                 &hearings,
                 window,
-                |this, _, event: &OpenEvidence, window, cx| {
+                |this, hearings, event: &OpenEvidence, window, cx| {
+                    let hearing = hearings.read(cx).selected();
+                    this.source_return = this.case_id.zip(hearing);
                     this.screen = Screen::Evidence;
                     this.open_page(event.evidence_id, event.page, window, cx);
                 },
@@ -245,6 +249,7 @@ impl FilesView {
             case_id: None,
             case_select,
             screen: Screen::Evidence,
+            source_return: None,
             hearings,
             recording,
             search,
@@ -1094,6 +1099,57 @@ impl FilesView {
         hearings::render_live_strip(&self.recording, on_return, window, cx)
     }
 
+    /// After a suggestion opened its source: a row with "Volver a la audiencia", when the live
+    /// strip does not already go back to that hearing.
+    fn render_source_return(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, hearing_id) = self
+            .source_return
+            .filter(|_| self.screen == Screen::Evidence)?;
+        let live = self.recording.read(cx).live_hearing();
+        if live == Some(hearing_id) {
+            return None;
+        }
+        Some(
+            h_flex()
+                .id("source-return-row")
+                .flex_none()
+                .h(px(40.))
+                .px_4()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new("source-return")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ArrowLeft)
+                        .label("Volver a la audiencia")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.return_to_source(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Shows the hearing of the suggestion whose source the evidence screen shows.
+    fn return_to_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((case_id, hearing_id)) = self.source_return.take() else {
+            return;
+        };
+        if self.case_id != Some(case_id) {
+            self.open_case(case_id, window, cx);
+            self.case_select.update(cx, |select, cx| {
+                select.set_selected_value(&case_id, window, cx)
+            });
+        }
+        self.screen = Screen::Hearings;
+        self.hearings.update(cx, |hearings, cx| {
+            hearings.show_hearing(case_id, hearing_id, window, cx)
+        });
+        cx.notify();
+    }
+
     /// Shows the live hearing: its case, the hearings screen, and the hearing.
     fn return_to_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((case_id, hearing_id)) = self
@@ -1812,6 +1868,7 @@ impl Render for FilesView {
             }))
             .child(self.render_header(cx))
             .children(self.render_live_strip(window, cx))
+            .children(self.render_source_return(cx))
             .child(body)
     }
 }
@@ -2788,6 +2845,23 @@ mod tests {
             assert!(window.find(("page", 2u64)).visible());
         })
         .unwrap();
+
+        // No recording runs, so the live strip has no way back: the evidence screen has one.
+        cx.update_window(window, |_, window, cx| window.click("source-return", cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.screen, Screen::Hearings);
+            assert_eq!(view.hearings.read(cx).selected(), Some(hearing));
+        });
+        assert!(
+            cx.update_window(window, |_, window, _| window
+                .try_find("source-return")
+                .is_none())
+                .unwrap()
+        );
     }
 
     #[gpui_kit::test]

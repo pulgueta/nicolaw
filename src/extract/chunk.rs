@@ -67,26 +67,25 @@ fn word_count(sentences: &[Vec<&str>]) -> usize {
     sentences.iter().map(Vec::len).sum()
 }
 
-/// The sentences of `text`, as lists of words. A sentence ends with a word that ends with
-/// ".", "!", "?", or "…". A sentence longer than `MAX_WORDS` is cut into parts.
-fn sentences(text: &str) -> Vec<Vec<&str>> {
-    let mut sentences = Vec::new();
-    let mut current = Vec::new();
-    for word in text.split_whitespace() {
-        current.push(word);
-        if word.ends_with(['.', '!', '?', '…']) || current.len() == MAX_WORDS {
-            sentences.push(std::mem::take(&mut current));
+/// The sentences of `text`, as lists of words, one at a time. A sentence ends with a word that
+/// ends with ".", "!", "?", or "…". A sentence longer than `MAX_WORDS` is cut into parts.
+fn sentences(text: &str) -> impl Iterator<Item = Vec<&str>> {
+    let mut words = text.split_whitespace();
+    std::iter::from_fn(move || {
+        let mut current = Vec::new();
+        for word in words.by_ref() {
+            current.push(word);
+            if word.ends_with(['.', '!', '?', '…']) || current.len() == MAX_WORDS {
+                return Some(current);
+            }
         }
-    }
-    if !current.is_empty() {
-        sentences.push(current);
-    }
-    sentences
+        (!current.is_empty()).then_some(current)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Chunk, MAX_WORDS, MIN_WORDS, chunk};
+    use super::{Chunk, MAX_WORDS, MIN_WORDS, chunk, sentences};
 
     fn words(text: &str) -> usize {
         text.split_whitespace().count()
@@ -95,6 +94,15 @@ mod tests {
     /// A sentence of 10 words with a unique number, for example "Frase 7 ...".
     fn sentence(n: usize) -> String {
         format!("Frase {n} tiene ocho palabras más para la prueba.")
+    }
+
+    #[test]
+    fn sentences_come_one_at_a_time() {
+        let mut sentences = sentences("Uno dos. Tres");
+
+        assert_eq!(sentences.next(), Some(vec!["Uno", "dos."]));
+        assert_eq!(sentences.next(), Some(vec!["Tres"]));
+        assert_eq!(sentences.next(), None);
     }
 
     #[test]

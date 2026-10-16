@@ -59,8 +59,8 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, kind, n
 
 - [x] T0 Scaffold commit on `main` (Cargo.toml with updated deps, .gitignore, README, hello-world main.rs) and `gh stack init foundation`. Route: inline.
 - [x] T1 Layer 1 `foundation`: cases, evidence hashing, extraction (PDF text, OCR, images, txt/md, docx), chunking, FTS5 search, Spanish UI with analysis status and search. Route: delegated writer (opus). Commit on `foundation`.
-- [ ] T2 Create private GitHub repo, push `main`, `gh stack submit --auto`. Route: inline.
-- [ ] T3 Layer 2 `transcription`: hearings, audio capture, VAD, streaming STT with Handy model discovery and download, live transcript, speaker toggle, WAV per hearing. Route: delegated writer (opus).
+- [x] T2 Create private GitHub repo, push `main`, `gh stack submit --auto`. Route: inline.
+- [x] T3 Layer 2 `transcription`: hearings, audio capture, VAD, streaming STT with Handy model discovery and download, live transcript, speaker toggle, WAV per hearing. Route: delegated writer (opus).
 - [ ] T4 Layer 3 `analysis`: claim extraction, case-scoped retrieval, NLI scoring, LLM explanation, suggestion queue UI. Route: delegated writer (opus).
 - [ ] T5 Final: `gh stack submit --auto`, `gh stack view --json` check, `cargo clean`, session summary.
 
@@ -151,6 +151,83 @@ suggestions(id, hearing_id, segment_id, chunk_id, claim, evidence_quote, kind, n
 | Add without a case | Cree un caso antes de agregar archivos. |
 | Type label fallback | Archivo |
 
+- T2: repository https://github.com/pulgueta/nicolaw created (private); `main` pushed; `gh stack submit --auto` created PR #1 for `foundation`. Parent spot check: `cargo fmt --check` exit 0, tree clean, no DEBUG prints; full `cargo test` rerun in progress.
+
+- T3: commits on `transcription`: `ca0b6d0` feat(store): add hearings and segments, `e0a7c84` feat(models): discover and download Handy GGUF models, `89a4724` feat(audio): add capture, VAD segmenter, and streaming transcription, `5718d3e` feat(app): add hearing screen with live transcript. This document is in the next commit (`docs(odd): record layer 2 evidence`).
+- T3 authored lines (`git diff --stat foundation..transcription`, before this document): 13 files, 4723 insertions, 23 deletions. Without `Cargo.lock`: 12 files, 4198 insertions, 23 deletions. Largest files: `src/hearings.rs` 1677 (about 350 of it view tests), `src/audio/pipeline.rs` 592 (about 280 tests), `src/audio/native.rs` 477, `src/store.rs` +398.
+- T3 modules: `src/models.rs` (catalog, discovery, download), `src/audio/segmenter.rs` (pure VAD state machine), `src/audio/pipeline.rs` (synchronous `Processor`: WAV, level, VAD, segments, live text, storage; `refine`), `src/audio/native.rs` (`handy-recorder` capture, AVFoundation permission request, Silero VAD and `transcribe-cpp` transcriber), `src/audio/fake.rs` (test fakes), `src/hearings.rs` (Audiencias screen). `src/app.rs` has the top-level tabs Pruebas / Audiencias.
+- T3 decisions that differ from the brief, or add to it:
+  - Dependencies: `handy-recorder` 0.1 fits (16 kHz mono f32, fixed 512-sample chunks = one Silero frame, permission status), so no direct `cpal`/`rubato`/`rtrb`. It does not prompt, so Nicolaw calls `AVCaptureDevice::requestAccessForMediaType` (`objc2-av-foundation` + `block2`) when the status is not determined. `hf-hub` is 0.4.3 (`ureq`, sync API); 1.0 is async-first and pulls reqwest, tokio, and xet.
+  - The processor is synchronous and runs in gpui background tasks (one for the processor, one for the refine pass), not in dedicated pipeline threads. Reason: headless view tests stay deterministic on the gpui test executor. The native transcriber owns its `Session` on one dedicated thread, because a `transcribe-cpp` `Stream` borrows its `Session`.
+  - `Transcriber` is `begin` / `feed` (returns new `Partial { committed, tentative }`) / `finish`. `Event::Partial` also carries `speaker` and `t_start_ms`; `Event::Final` carries the stored `Segment`; `Event::Refined` reports the refine pass. Input is `Frame(Vec<f32>)` / `Pause` / `Failed`.
+  - A segment row is inserted (`final = 0`) at speech start, with the speaker of the switch at that moment; it is finished at the end. A segment with no words is deleted (noise).
+  - Segmenter: pre-roll keeps whole frames until at least 300 ms (10 frames = 320 ms); 600 ms of silence ends a segment (19 frames); 30 s maximum. `t_end_ms` is the end of the last speech frame. Pause flushes the segment and clears the pre-roll. Times are positions in the WAV (paused time is not in the WAV).
+  - Cohere Transcribe can also be the live model (it is the only model on this machine). It is not a streaming model, so its text shows when the segment ends. The refine pass runs only when the live model is not Cohere and Cohere is installed.
+  - The Silero VAD GGUF comes from `handy-computer/silero-vad-v6.2-gguf` (`silero-vad-v6.2-F32.gguf`, 1.2 MB). Handy bundles it in the app; the installed Handy.app on this machine still has `silero_vad_v4.onnx`. "Descargar" downloads every missing required model: Nemotron (Q4_K_M, as in the brief; Handy's default is Q8_0) and the VAD. The VAD runs on the CPU.
+  - Downloads use Handy's pinned revisions. Discovery prefers the pinned snapshot and the download quant, accepts any quant, and ignores dead snapshot links.
+  - WAV: 16-bit PCM, header flushed every 10 s. A hearing records one time: after Finalizar, or after an interruption, it is read-only (no append to the WAV).
+  - `transcribe_cpp::disable_logging()` keeps stderr empty. `NativeTranscriber` joins its thread on drop: a Metal model that is still loaded at process exit makes ggml abort (`ggml-metal-device.m:1040 GGML_ASSERT([rsets->data count] == 0)`, observed before the fix). An `on_app_quit` hook ends a live recording like Finalizar and waits up to 10 s.
+  - Icons: the component icon set has no `Download`, `CircleStop`, or `ArrowLeftRight`, so the view uses `ArrowDown`, `Square`, and `RefreshCw`.
+  - Default hearing title: `Audiencia DD/MM/YYYY` (local date from SQLite, Colombian order).
+- T3 TDD evidence (runner `cargo test`):
+  - store RED: 37 compile errors (`unresolved import super::Speaker`, `no method named create_hearing`, `hearings`, `insert_segment`, ...). GREEN: 27 passed. `today` RED: `no method named today`; GREEN: 1 passed.
+  - models RED: `unresolved imports super::CATALOG, super::COHERE, super::ModelDirs, ...`. First GREEN compile failed in the test helper (`expected &str, found String`); helper fixed; GREEN: 9 passed.
+  - segmenter RED: `unresolved imports super::Output, super::Segmenter`. GREEN: 8 passed.
+  - pipeline RED: `unresolved imports super::Event, super::Input, super::Processor, super::RefineJob, super::refine` and `super::AudioError, ...`. First run: 7 passed, 1 failed (the test expected a final at `finish`, but `Pause` had already closed the segment: test error, fixed). GREEN: 8 passed.
+  - hearings view RED: `unresolved imports super::HearingsEnv, super::HearingsView, super::format_time, super::speaker_label`. First compile: 3 missing icons. GREEN: 7 passed.
+  - navigation RED: `E0061 this function takes 3 arguments but 4 arguments were supplied`. GREEN: full suite 99 passed, 2 ignored.
+- T3 checks (final tree `5718d3e`): `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0 (only the dependency note about `block v0.1.6`); `cargo test` 99 passed, 0 failed, 2 ignored; `cargo build` exit 0; start check `HOME=/tmp/nicolaw-home ./target/debug/nicolaw` alive after 8 s, stderr 0 bytes, database `user_version` 3 with `hearings` and `segments`.
+- T3 per-commit checks: each commit was checked out alone in a temporary worktree: `ca0b6d0` store tests 28 passed; `e0a7c84` models tests 9 passed; `89a4724` audio tests 16 passed, 2 ignored; `5718d3e` build exit 0. The first three commits have dead-code warnings in the non-test build (their API is used by later commits), so `clippy -D warnings` passes on the final tree only.
+- T3 real-model checks (`#[ignore]`, `cargo test -- --ignored --nocapture real_`): Cohere Transcribe Q5_K_M from Handy's cache, Metal. Paulina (es_MX): "Buenos días. La audiencia empieza a las nueve de la mañana. El acusado dice que no estaba en Bogotá el 12 de marzo." (exact). Monica (es_ES), same text: "Buenos días, la audiencia en Pisa a las nueve de la mañana, ..." ("empieza" misheard); Monica, short sentence only: "La Odincha en Pisa a las nueve de la mañana." Silero VAD downloaded into a temporary cache (157 progress calls, last 1241056/1241056), 222 speech frames in the Paulina WAV, 0 in 30 silent frames.
+- T3 not observed: a real microphone and the macOS permission prompt; Nemotron Streaming (not installed, so the streaming and partial-text path of `NativeTranscriber` ran with the fake only); the download of Nemotron; the refine pass with real models; the quit hook; the Audiencias screen in a visible window (headless tests only).
+
+## UI copy (layer 2)
+
+| Location | Text |
+| --- | --- |
+| Screen tabs | Pruebas, Audiencias |
+| New hearing button / dialog title | Nueva audiencia |
+| New hearing title placeholder | Título de la audiencia |
+| New hearing default title | Audiencia <DD/MM/YYYY> |
+| New hearing confirm / cancel | Crear / Cancelar |
+| Hearing row, not started | Sin iniciar |
+| Hearing row tags | En curso, Finalizada |
+| No hearings | No hay audiencias. Seleccione Nueva audiencia. |
+| No selection | Seleccione una audiencia. |
+| Delete button | Eliminar |
+| Delete dialog title | ¿Eliminar esta audiencia? |
+| Delete dialog description | Nicolaw eliminará "<title>", su transcripción y su audio. No puede deshacer esta acción. |
+| Delete dialog confirm / cancel | Eliminar / Cancelar |
+| Model select placeholder / accessible name | Sin modelo instalado / Modelo de voz |
+| Microphone select placeholder / accessible name | Sin micrófono / Micrófono |
+| Recording buttons | Iniciar, Pausar, Reanudar, Finalizar |
+| Download button | Descargar |
+| Download details | <model names, joined with " y "> · <n> MB |
+| Download progress accessible name | Descarga |
+| Speaker switch | Habla el acusado |
+| Mic level accessible name | Nivel del micrófono |
+| Speaker tags | Acusado, Otro |
+| Speaker toggle tooltip | Cambiar hablante |
+| Ended hearing | Grabación finalizada: <ended_at>. |
+| Interrupted hearing | La grabación se detuvo antes de Finalizar. |
+| Transcript, not started | Seleccione Iniciar para grabar y transcribir la audiencia. |
+| Transcript, recording, no text yet | Nicolaw escucha. El texto aparece aquí cuando alguien habla. |
+| Transcript, ended, no text | Esta audiencia no tiene transcripción. |
+| No model installed | No hay un modelo de voz instalado. Seleccione Descargar para instalarlo. |
+| No microphone | Nicolaw no encuentra un micrófono. Conecte un micrófono y seleccione Iniciar. |
+| Microphone permission denied | Nicolaw no tiene permiso para usar el micrófono. Abra Configuración del Sistema > Privacidad y seguridad > Micrófono y active el permiso. |
+| Model busy | El modelo de voz está en uso. Finalice la otra audiencia y seleccione Iniciar. |
+| Model load failed | Nicolaw no puede cargar el modelo de voz. Descargue el modelo de nuevo. |
+| Microphone failed | El micrófono dejó de funcionar. Nicolaw guardó la transcripción hasta este punto. |
+| Transcription failed | La transcripción de un segmento falló. |
+| Storage error | Nicolaw no puede guardar la transcripción. |
+| Audio file error | Nicolaw no puede guardar el audio de la audiencia. |
+| Download failed | La descarga falló. Revise la conexión a internet y seleccione Descargar. |
+| List error | Nicolaw no puede leer las audiencias. |
+| Create error | Nicolaw no puede crear la audiencia. Intente de nuevo. |
+| Delete error | Nicolaw no puede eliminar la audiencia. Intente de nuevo. |
+| Speaker change error | Nicolaw no puede cambiar el hablante. Intente de nuevo. |
+
 ## Next step
 
-T2: manual check of layer 1 in a visible window (case dialog, select, drag and drop, OCR of a real scan, search), then create the private GitHub repository and submit the stack.
+T3 manual check in a visible window: the microphone permission prompt, a real hearing with Nemotron Streaming (select Descargar first), partial text, Pausar / Reanudar / Finalizar, and the refine pass with Cohere. Then T4 (layer 3 `analysis`).

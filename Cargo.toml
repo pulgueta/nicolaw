@@ -7,15 +7,21 @@ edition = "2024"
 async-channel = "2.5"
 dirs = "7.0.0"
 gpui-kit = "0.7"
+handy-recorder = "0.1"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
+hound = "3.5"
 mime_guess = "2.0.5"
 quick-xml = "0.41"
 rusqlite = { version = "0.40.2", features = ["blob", "bundled"] }
 sha2 = "0.11"
+transcribe-cpp = "0.4"
 zip = { version = "5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
 objc2-foundation = "0.3.2"
 objc2-pdf-kit = { version = "0.3.2", features = ["objc2-app-kit"] }
 objc2-vision = { version = "0.3.2", features = ["objc2-core-foundation"] }

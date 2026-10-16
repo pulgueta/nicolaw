@@ -37,7 +37,7 @@ use gpui_kit::*;
 
 use crate::analysis;
 use crate::extract::{Page, PageSource};
-use crate::hearings::{self, HearingsEnv, HearingsView, Recording};
+use crate::hearings::{self, HearingsEnv, HearingsView, OpenEvidence, Recording};
 use crate::preview::{self, Preview};
 use crate::store::{
     AnalysisStatus, Case, Evidence, ImportError, SearchGroup, SearchHit, Store, file_name,
@@ -116,6 +116,8 @@ pub struct FilesView {
     case_select: Entity<SelectState<Vec<CaseItem>>>,
     screen: Screen,
     hearings: Entity<HearingsView>,
+    /// The case and the hearing of the suggestion whose source the evidence screen shows.
+    source_return: Option<(i64, i64)>,
     /// The live recording. The app owns it, so it continues on every screen and case.
     recording: Entity<Recording>,
     search: Entity<InputState>,
@@ -195,6 +197,17 @@ impl FilesView {
                     }
                 },
             ),
+            // The source of a suggestion opens the evidence at its page.
+            cx.subscribe_in(
+                &hearings,
+                window,
+                |this, hearings, event: &OpenEvidence, window, cx| {
+                    let hearing = hearings.read(cx).selected();
+                    this.source_return = this.case_id.zip(hearing);
+                    this.screen = Screen::Evidence;
+                    this.open_page(event.evidence_id, event.page, window, cx);
+                },
+            ),
         ];
 
         let start_store = store.clone();
@@ -236,6 +249,7 @@ impl FilesView {
             case_id: None,
             case_select,
             screen: Screen::Evidence,
+            source_return: None,
             hearings,
             recording,
             search,
@@ -738,10 +752,22 @@ impl FilesView {
 
     /// Selects the evidence of the hit and shows its text at the page of the hit.
     fn open_hit(&mut self, hit: &SearchHit, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(hit.evidence_id, window, cx);
+        self.open_page(hit.evidence_id, hit.page, window, cx);
         self.selected_hit = Some(hit.chunk_id);
+    }
+
+    /// Selects the evidence and shows its text at the page.
+    fn open_page(
+        &mut self,
+        evidence_id: i64,
+        page: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select(evidence_id, window, cx);
+        self.selected_hit = None;
         self.tab = Tab::Text;
-        self.focus_page = Some(hit.page);
+        self.focus_page = Some(page);
         self.scroll_to_focus_page();
         cx.notify();
     }
@@ -996,6 +1022,9 @@ impl FilesView {
                                     this.screen = if *index == 0 {
                                         Screen::Evidence
                                     } else {
+                                        this.hearings.update(cx, |hearings, cx| {
+                                            hearings.reload_suggestions(cx)
+                                        });
                                         Screen::Hearings
                                     };
                                     cx.notify();
@@ -1068,6 +1097,57 @@ impl FilesView {
             }) as hearings::OnReturn
         });
         hearings::render_live_strip(&self.recording, on_return, window, cx)
+    }
+
+    /// After a suggestion opened its source: a row with "Volver a la audiencia", when the live
+    /// strip does not already go back to that hearing.
+    fn render_source_return(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, hearing_id) = self
+            .source_return
+            .filter(|_| self.screen == Screen::Evidence)?;
+        let live = self.recording.read(cx).live_hearing();
+        if live == Some(hearing_id) {
+            return None;
+        }
+        Some(
+            h_flex()
+                .id("source-return-row")
+                .flex_none()
+                .h(px(40.))
+                .px_4()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new("source-return")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ArrowLeft)
+                        .label("Volver a la audiencia")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.return_to_source(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Shows the hearing of the suggestion whose source the evidence screen shows.
+    fn return_to_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((case_id, hearing_id)) = self.source_return.take() else {
+            return;
+        };
+        if self.case_id != Some(case_id) {
+            self.open_case(case_id, window, cx);
+            self.case_select.update(cx, |select, cx| {
+                select.set_selected_value(&case_id, window, cx)
+            });
+        }
+        self.screen = Screen::Hearings;
+        self.hearings.update(cx, |hearings, cx| {
+            hearings.show_hearing(case_id, hearing_id, window, cx)
+        });
+        cx.notify();
     }
 
     /// Shows the live hearing: its case, the hearings screen, and the hearing.
@@ -1788,6 +1868,7 @@ impl Render for FilesView {
             }))
             .child(self.render_header(cx))
             .children(self.render_live_strip(window, cx))
+            .children(self.render_source_return(cx))
             .child(body)
     }
 }
@@ -1829,14 +1910,23 @@ mod tests {
     use crate::extract::{Page, PageSource};
     use crate::hearings::HearingsEnv;
     use crate::models::{ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model};
-    use crate::store::{AnalysisStatus, Store};
+    use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
+    use crate::store::{AnalysisStatus, NewSuggestion, Speaker, Store, SuggestionLevel};
 
     const WAIT: Duration = Duration::from_secs(1);
 
     fn open(store: Store, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<FilesView>) {
         let dir = temp_dir("hearings-env");
+        let review = FakeReviewBackend::new(
+            FakeLlm::new("[]", "{}"),
+            FakeNli {
+                word: String::new(),
+                contradiction: 0.0,
+            },
+        );
         let env = HearingsEnv {
             backend: Arc::new(FakeBackend::new("")),
+            review: Arc::new(review),
             model_dirs: ModelDirs {
                 hf_cache: dir.join("hub"),
                 handy: dir.join("handy"),
@@ -2525,8 +2615,16 @@ mod tests {
         write_fake_model(&dirs.handy.join(NEMOTRON.file), &NEMOTRON);
         write_fake_model(&dirs.handy.join(SILERO_VAD.file), &SILERO_VAD);
         let backend = FakeBackend::new("");
+        let review = FakeReviewBackend::new(
+            FakeLlm::new("[]", "{}"),
+            FakeNli {
+                word: String::new(),
+                contradiction: 0.0,
+            },
+        );
         let env = HearingsEnv {
             backend: Arc::new(backend.clone()),
+            review: Arc::new(review),
             model_dirs: dirs,
             data_dir: dir.join("data"),
         };
@@ -2664,6 +2762,178 @@ mod tests {
             .unwrap();
         cx.wait_for(window, WAIT, |window, _| {
             window.try_find("hearings").is_none() && window.try_find("empty-state").is_some()
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn the_source_of_a_suggestion_opens_the_evidence_at_its_page(cx: &mut TestAppContext) {
+        let path = temp_dir("source").join("acta.txt");
+        fs::write(&path, "x").unwrap();
+        let (store, case) = store_with_case();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let page = |number: u32, text: &str| Page {
+            number,
+            text: text.into(),
+            source: PageSource::Text,
+        };
+        store
+            .save_analysis(
+                evidence,
+                &[
+                    page(1, "Primera página."),
+                    page(2, "La declaración del acusado fue rendida en Bogotá."),
+                ],
+            )
+            .unwrap();
+        let chunk = store.search(case, "declaracion", 1).unwrap()[0].chunk_id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store.insert_segment(hearing, 0, Speaker::Accused).unwrap();
+        store
+            .finish_segment(segment, "Declaré en Medellín.", 2_000)
+            .unwrap();
+        let suggestion = store
+            .insert_suggestion(&NewSuggestion {
+                hearing_id: hearing,
+                segment_id: segment,
+                chunk_id: chunk,
+                claim: "El acusado declaró en Medellín.".into(),
+                claim_quote: None,
+                evidence_quote: "fue rendida en Bogotá".into(),
+                kind: None,
+                level: SuggestionLevel::Check,
+                nli_contradiction: 0.7,
+                explanation: None,
+                segment_revision: 0,
+            })
+            .unwrap()
+            .id as u64;
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click(("hearing", hearing as u64), cx)
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("source", suggestion)).is_some()
+        })
+        .await;
+
+        cx.update_window(window, |_, window, cx| {
+            window.click(("source", suggestion), cx)
+        })
+        .unwrap();
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("page", 2u64)).is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.screen, Screen::Evidence);
+            assert_eq!(view.selected, Some(evidence));
+            assert_eq!(view.tab, Tab::Text);
+        });
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find(("page", 2u64)).visible());
+        })
+        .unwrap();
+
+        // No recording runs, so the live strip has no way back: the evidence screen has one.
+        cx.update_window(window, |_, window, cx| window.click("source-return", cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.screen, Screen::Hearings);
+            assert_eq!(view.hearings.read(cx).selected(), Some(hearing));
+        });
+        assert!(
+            cx.update_window(window, |_, window, _| window
+                .try_find("source-return")
+                .is_none())
+                .unwrap()
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn suggestions_of_deleted_evidence_are_gone_after_a_return_to_the_hearings(
+        cx: &mut TestAppContext,
+    ) {
+        let path = temp_dir("deleted-source").join("acta.txt");
+        fs::write(&path, "x").unwrap();
+        let (store, case) = store_with_case();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let page = Page {
+            number: 1,
+            text: "La declaración del acusado fue rendida en Bogotá.".into(),
+            source: PageSource::Text,
+        };
+        store.save_analysis(evidence, &[page]).unwrap();
+        let chunk = store.search(case, "declaracion", 1).unwrap()[0].chunk_id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store.insert_segment(hearing, 0, Speaker::Accused).unwrap();
+        store
+            .finish_segment(segment, "Declaré en Medellín.", 2_000)
+            .unwrap();
+        let suggestion = store
+            .insert_suggestion(&NewSuggestion {
+                hearing_id: hearing,
+                segment_id: segment,
+                chunk_id: chunk,
+                claim: "El acusado declaró en Medellín.".into(),
+                claim_quote: None,
+                evidence_quote: "fue rendida en Bogotá".into(),
+                kind: None,
+                level: SuggestionLevel::Check,
+                nli_contradiction: 0.7,
+                explanation: None,
+                segment_revision: 0,
+            })
+            .unwrap()
+            .id as u64;
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).list_loaded)
+            .await;
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click(("hearing", hearing as u64), cx)
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("source", suggestion)).is_some()
+        })
+        .await;
+
+        cx.update_window(window, |_, window, cx| window.click("screen-evidence", cx))
+            .unwrap();
+        cx.update(|cx| {
+            view.read(cx)
+                .store
+                .lock()
+                .unwrap()
+                .delete(evidence)
+                .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+                && window.try_find(("source", suggestion)).is_none()
         })
         .await;
     }

@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 async-channel = "2.5"
+candle-core = { version = "0.11", features = ["metal"] }
+candle-nn = { version = "0.11", features = ["metal"] }
+candle-transformers = { version = "0.11", features = ["metal"] }
 dirs = "7.0.0"
 gpui-kit = "0.7"
 handy-recorder = "0.1"
@@ -13,7 +16,10 @@ hound = "3.5"
 mime_guess = "2.0.5"
 quick-xml = "0.41"
 rusqlite = { version = "0.40.2", features = ["blob", "bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 sha2 = "0.11"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 transcribe-cpp = "0.4"
 zip = { version = "5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
@@ -27,6 +33,12 @@ objc2-pdf-kit = { version = "0.3.2", features = ["objc2-app-kit"] }
 objc2-vision = { version = "0.3.2", features = ["objc2-core-foundation"] }
 
 [profile.dev.package]
+candle-core = { opt-level = 3 }
+candle-nn = { opt-level = 3 }
+candle-transformers = { opt-level = 3 }
+candle-metal-kernels = { opt-level = 3 }
+gemm = { opt-level = 3 }
+tokenizers = { opt-level = 3 }
 gpui-pre = { opt-level = 3 }
 gpui-component = { opt-level = 3 }
 gpui-kit = { opt-level = 3 }

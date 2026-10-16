@@ -1,10 +1,15 @@
-//! Speech models: the catalog of models that Nicolaw can use, discovery of model files that
-//! Handy (or Nicolaw) already downloaded, and download on request.
+//! Models: the catalog of models that Nicolaw can use, discovery of model files that Handy (or
+//! Nicolaw) already downloaded, and download on request.
+//!
+//! Speech models:
 //!
 //! Handy keeps catalog models in the Hugging Face cache:
 //! `<cache>/models--handy-computer--<slug>-gguf/snapshots/<revision>/<slug>-<QUANT>.gguf`.
 //! Older Handy versions and custom files use `<data dir>/com.pais.handy/models/*.gguf`.
 //! Nicolaw downloads into the same cache, so both applications share the files.
+//!
+//! Analysis models ([`NLI`], [`LLM`]) have more than one file, from pinned revisions of their
+//! Hugging Face repositories. They are installed when all their files are in the cache.
 
 use std::fs;
 use std::io::{self, Read as _};
@@ -23,6 +28,10 @@ pub enum Role {
     Refine,
     /// Voice activity detection: finds the start and the end of speech.
     Vad,
+    /// Natural language inference: the probability that a passage contradicts a statement.
+    Nli,
+    /// The language model: finds the statements in a segment, and explains a conflict.
+    Llm,
 }
 
 /// One model of the catalog. The values come from Handy's catalog.
@@ -91,6 +100,86 @@ pub const SILERO_VAD: CatalogModel = CatalogModel {
 };
 
 pub const CATALOG: [&CatalogModel; 3] = [&NEMOTRON, &COHERE, &SILERO_VAD];
+
+/// One file of an analysis model, in a pinned revision of its Hugging Face repository.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RepoFile {
+    pub repo: &'static str,
+    pub revision: &'static str,
+    pub file: &'static str,
+    /// The size of the file in MB, for the download size and the progress.
+    pub size_mb: u32,
+}
+
+/// A model of the analysis. It has more than one file.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AnalysisModel {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub role: Role,
+    pub files: &'static [RepoFile],
+}
+
+impl AnalysisModel {
+    pub fn size_mb(&self) -> u32 {
+        self.files.iter().map(|file| file.size_mb).sum()
+    }
+}
+
+const NLI_REPO: &str = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7";
+const NLI_REVISION: &str = "b5113eb38ab63efdd7f280f8c144ea8b13f978ce";
+
+/// Multilingual mDeBERTa-v3 NLI (MIT). Labels: entailment, neutral, contradiction. The
+/// weights are float16 on disk; Nicolaw runs them as float32.
+pub const NLI: AnalysisModel = AnalysisModel {
+    key: "nli",
+    name: "mDeBERTa-v3 NLI",
+    role: Role::Nli,
+    files: &[
+        RepoFile {
+            repo: NLI_REPO,
+            revision: NLI_REVISION,
+            file: "config.json",
+            size_mb: 1,
+        },
+        RepoFile {
+            repo: NLI_REPO,
+            revision: NLI_REVISION,
+            file: "tokenizer.json",
+            size_mb: 16,
+        },
+        RepoFile {
+            repo: NLI_REPO,
+            revision: NLI_REVISION,
+            file: "model.safetensors",
+            size_mb: 558,
+        },
+    ],
+};
+
+/// Qwen3 4B (Apache 2.0), the official Q4_K_M GGUF of the Qwen team. The GGUF file has no
+/// tokenizer that `tokenizers` can read, so the tokenizer comes from the original repository.
+pub const LLM: AnalysisModel = AnalysisModel {
+    key: "llm",
+    name: "Qwen3 4B",
+    role: Role::Llm,
+    files: &[
+        RepoFile {
+            repo: "Qwen/Qwen3-4B-GGUF",
+            revision: "bc640142c66e1fdd12af0bd68f40445458f3869b",
+            file: "Qwen3-4B-Q4_K_M.gguf",
+            size_mb: 2497,
+        },
+        RepoFile {
+            repo: "Qwen/Qwen3-4B",
+            revision: "1cfa9a7208912126459214e8b04321603b3df60c",
+            file: "tokenizer.json",
+            size_mb: 11,
+        },
+    ],
+};
+
+pub const ANALYSIS_MODELS: [&AnalysisModel; 2] = [&NLI, &LLM];
 
 /// The folders where model files can be.
 #[derive(Clone, Debug)]
@@ -223,6 +312,41 @@ pub fn write_fake_model(path: &Path, model: &CatalogModel) {
         .unwrap();
 }
 
+/// The local files of an analysis model, in the order of [`AnalysisModel::files`], if all of
+/// them are in the cache at their pinned revision. Reads the file system: do not call this
+/// function on the UI thread.
+pub fn find_files(dirs: &ModelDirs, model: &AnalysisModel) -> Option<Vec<PathBuf>> {
+    model
+        .files
+        .iter()
+        .map(|file| {
+            let path = snapshot_path(dirs, file);
+            (path.is_file() && is_valid_file(&path)).then_some(path)
+        })
+        .collect()
+}
+
+/// False for a JSON file of an analysis model that does not start with `{`, for example an
+/// error page that a download saved. Other files are not checked.
+pub fn is_valid_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|extension| extension != "json") {
+        return true;
+    }
+    let mut first = [0; 1];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut first))
+        .is_ok_and(|()| first == *b"{")
+}
+
+/// The path of the file in the cache snapshot of its pinned revision.
+fn snapshot_path(dirs: &ModelDirs, file: &RepoFile) -> PathBuf {
+    dirs.hf_cache
+        .join(format!("models--{}", file.repo.replace('/', "--")))
+        .join("snapshots")
+        .join(file.revision)
+        .join(file.file)
+}
+
 /// Downloads the model file into the Hugging Face cache. Calls `progress` with
 /// (bytes done, bytes total). Blocks until the download ends: do not call this function on the
 /// UI thread.
@@ -231,14 +355,62 @@ pub fn download(
     dirs: &ModelDirs,
     progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, String> {
+    download_file(&model.repo(), model.revision, model.file, dirs, progress)
+}
+
+/// Downloads the missing files of an analysis model into the Hugging Face cache. A file that
+/// is already in the cache is not downloaded again, so a failed download continues. A file
+/// that is not valid moves aside and downloads again. Calls
+/// `progress` with the part of the model that is done, from 0 to 1. Blocks until the download
+/// ends: do not call this function on the UI thread.
+pub fn download_files(
+    model: &AnalysisModel,
+    dirs: &ModelDirs,
+    mut progress: impl FnMut(f32),
+) -> Result<Vec<PathBuf>, String> {
+    let total = model.size_mb().max(1) as f32;
+    let mut done_mb = 0.0;
+    let mut paths = Vec::new();
+    for file in model.files {
+        let cached = snapshot_path(dirs, file);
+        if cached.is_file() && !is_valid_file(&cached) {
+            quarantine(&cached).map_err(|error| error.to_string())?;
+        }
+        if cached.is_file() {
+            done_mb += file.size_mb as f32;
+            progress(done_mb / total);
+            paths.push(cached);
+            continue;
+        }
+        let path = download_file(file.repo, file.revision, file.file, dirs, |done, size| {
+            let part = if size == 0 {
+                0.0
+            } else {
+                done as f32 / size as f32
+            };
+            progress((done_mb + part * file.size_mb as f32) / total);
+        })?;
+        done_mb += file.size_mb as f32;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn download_file(
+    repo: &str,
+    revision: &str,
+    file: &str,
+    dirs: &ModelDirs,
+    progress: impl FnMut(u64, u64),
+) -> Result<PathBuf, String> {
     let api = ApiBuilder::from_cache(Cache::new(dirs.hf_cache.clone()))
         .with_progress(false)
         .build()
         .map_err(|error| error.to_string())?;
-    let repo = Repo::with_revision(model.repo(), RepoType::Model, model.revision.to_owned());
+    let repo = Repo::with_revision(repo.to_owned(), RepoType::Model, revision.to_owned());
     api.repo(repo)
         .download_with_progress(
-            model.file,
+            file,
             Report {
                 done: 0,
                 total: 0,
@@ -275,8 +447,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        CATALOG, COHERE, ModelDirs, NEMOTRON, SILERO_VAD, discover, quant, quarantine,
-        write_fake_model,
+        ANALYSIS_MODELS, CATALOG, COHERE, LLM, ModelDirs, NEMOTRON, NLI, Role, SILERO_VAD,
+        discover, find_files, is_valid_file, quant, quarantine, write_fake_model,
     };
 
     /// Empty Hugging Face cache and Handy model folders in a new temporary folder.
@@ -304,6 +476,7 @@ mod tests {
         let model = CATALOG.iter().find(|model| model.file == file);
         match model {
             Some(model) => write_fake_model(&blob, model),
+            None if file.ends_with(".json") => fs::write(&blob, b"{}").unwrap(),
             None => fs::write(&blob, b"GGUF").unwrap(),
         }
         let link = repo_dir.join("snapshots").join(revision).join(file);
@@ -511,5 +684,94 @@ mod tests {
             path_of(&dirs, "cohere").as_deref(),
             Some(Path::new(&cached))
         );
+    }
+
+    #[test]
+    fn the_analysis_models_are_the_nli_model_and_the_language_model() {
+        let keys: Vec<&str> = ANALYSIS_MODELS.iter().map(|model| model.key).collect();
+
+        assert_eq!(keys, ["nli", "llm"]);
+        assert_eq!(NLI.role, Role::Nli);
+        assert_eq!(LLM.role, Role::Llm);
+        let nli: Vec<(&str, &str)> = NLI.files.iter().map(|f| (f.repo, f.file)).collect();
+        assert_eq!(
+            nli,
+            [
+                (
+                    "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+                    "config.json"
+                ),
+                (
+                    "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+                    "tokenizer.json"
+                ),
+                (
+                    "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+                    "model.safetensors"
+                ),
+            ]
+        );
+        let llm: Vec<(&str, &str)> = LLM.files.iter().map(|f| (f.repo, f.file)).collect();
+        assert_eq!(
+            llm,
+            [
+                ("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
+                ("Qwen/Qwen3-4B", "tokenizer.json"),
+            ]
+        );
+        // The sizes of the files on Hugging Face, in MB.
+        assert_eq!(NLI.size_mb(), 575);
+        assert_eq!(LLM.size_mb(), 2508);
+    }
+
+    #[test]
+    fn an_analysis_model_is_installed_when_all_its_files_are_in_the_cache() {
+        let dirs = dirs("analysis");
+        assert_eq!(find_files(&dirs, &NLI), None);
+        let mut paths = Vec::new();
+        for file in NLI.files {
+            assert_eq!(find_files(&dirs, &NLI), None, "partial model");
+            paths.push(cache_file(
+                &dirs,
+                file.repo.into(),
+                file.revision,
+                file.file,
+            ));
+        }
+
+        assert_eq!(find_files(&dirs, &NLI), Some(paths));
+        assert_eq!(find_files(&dirs, &LLM), None);
+    }
+
+    #[test]
+    fn a_json_file_that_does_not_start_with_a_brace_is_invalid() {
+        let dirs = dirs("json");
+        let mut paths = Vec::new();
+        for file in NLI.files {
+            paths.push(cache_file(
+                &dirs,
+                file.repo.into(),
+                file.revision,
+                file.file,
+            ));
+        }
+        assert!(find_files(&dirs, &NLI).is_some());
+
+        let config = fs::canonicalize(&paths[0]).unwrap();
+        fs::write(&config, b"<html>not found</html>").unwrap();
+
+        assert_eq!(find_files(&dirs, &NLI), None);
+        assert!(!is_valid_file(&paths[0]));
+        assert!(is_valid_file(&paths[2]), "a weights file has no JSON check");
+    }
+
+    #[test]
+    fn an_analysis_file_of_an_other_revision_is_not_used() {
+        let dirs = dirs("revision");
+        for file in LLM.files {
+            cache_file(&dirs, file.repo.into(), "main", file.file);
+        }
+
+        assert_eq!(find_files(&dirs, &LLM), None);
     }
 }

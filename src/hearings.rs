@@ -1,8 +1,10 @@
-//! The hearings screen: the hearings of a case, live recording and transcription, and the
-//! transcript with the speaker of each segment. The [`Recording`] controller owns the live
-//! recording. The app owns it, so that it outlives the window and the quit can complete it.
+//! The hearings screen: the hearings of a case, live recording and transcription, the
+//! transcript with the speaker of each segment, and the suggestions of the analysis. The
+//! [`Recording`] controller owns the live recording. The app owns it, so that it outlives the
+//! window and the quit can complete it.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,7 +19,9 @@ use gpui_kit::component::list::ListItem;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Placement, Sizable as _, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
@@ -31,9 +35,15 @@ use crate::audio::pipeline::{
 };
 use crate::audio::{AudioError, Backend, Capture, Engines, Microphone, ModelPaths, SAMPLE_RATE};
 use crate::models::{
-    self, CATALOG, COHERE, CatalogModel, ModelDirs, ModelStatus, NEMOTRON, SILERO_VAD,
+    self, ANALYSIS_MODELS, AnalysisModel, CATALOG, COHERE, CatalogModel, ModelDirs, ModelStatus,
+    NEMOTRON, SILERO_VAD,
 };
-use crate::store::{Hearing, Segment, Speaker, Store};
+use crate::review::analyzer::{self, Analyzer, Job, JobQueue, ModelGate, text_hash};
+use crate::review::{ReviewBackend, ReviewError, ReviewEvent};
+use crate::store::{
+    AnalysisState, Hearing, Segment, Speaker, Store, Suggestion, SuggestionCounts, SuggestionKind,
+    SuggestionLevel, SuggestionStatus, locator_label,
+};
 
 actions!(
     nicolaw,
@@ -43,9 +53,22 @@ actions!(
         /// Pauses or continues the live recording.
         TogglePause,
         /// Changes the speaker of the next speech.
-        SwitchSpeaker
+        SwitchSpeaker,
+        /// Opens the suggestions drawer of a narrow window.
+        OpenSuggestions,
+        /// Closes the suggestions drawer.
+        CloseSuggestions
     ]
 );
+
+/// The key context of the suggestions drawer, for Escape.
+const DRAWER_CONTEXT: &str = "SuggestionsDrawer";
+/// The key context of the button that opens the drawer.
+const TRIGGER_CONTEXT: &str = "SuggestionsTrigger";
+/// The width of the suggestions panel, and of the drawer in a narrow window.
+const PANEL_WIDTH: f32 = 360.;
+/// An evidence passage longer than this many characters shows its start first.
+const SHORT_QUOTE: usize = 240;
 
 const LIST_ERROR: &str = "Nicolaw no puede leer las audiencias.";
 const CREATE_ERROR: &str = "Nicolaw no puede crear la audiencia. Intente de nuevo.";
@@ -78,11 +101,21 @@ const NARROW_WIDTH: f32 = 1000.;
 const MICROPHONE_SETTING: &str = "microphone";
 /// The value of "Micrófono del sistema" in the microphone select.
 const SYSTEM_MICROPHONE: &str = "";
+const SUGGESTION_ERROR: &str = "Nicolaw no puede guardar la decisión. Intente de nuevo.";
+const STALE_TEXT: &str = "La transcripción cambió. Esta sugerencia requiere otra revisión.";
+const STALE_SPEAKER: &str = "Hablante corregido. Nicolaw actualizará las sugerencias.";
+/// A quiet panel does not mean that the statements agree with the evidence.
+const NO_OPEN_SUGGESTIONS: &str = "No hay sugerencias abiertas. Esto no confirma la declaración.";
+/// The analysis queue keeps at most this number of segments. When it is full, a new segment
+/// replaces the oldest one, so that the analysis never slows the transcription.
+const REVIEW_QUEUE: usize = 32;
 
 /// What the hearings screen needs from the app.
 #[derive(Clone)]
 pub struct HearingsEnv {
     pub backend: Arc<dyn Backend>,
+    /// Loads the analysis models.
+    pub review: Arc<dyn ReviewBackend>,
     pub model_dirs: ModelDirs,
     /// `<data_dir>/nicolaw`. The audio of each hearing goes to `hearings/<id>.wav` in it.
     pub data_dir: PathBuf,
@@ -95,6 +128,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-r", StartRecording, None),
         KeyBinding::new("cmd-shift-p", TogglePause, None),
         KeyBinding::new("cmd-shift-a", SwitchSpeaker, None),
+        KeyBinding::new("escape", CloseSuggestions, Some(DRAWER_CONTEXT)),
+        KeyBinding::new("enter", OpenSuggestions, Some(TRIGGER_CONTEXT)),
+        KeyBinding::new("space", OpenSuggestions, Some(TRIGGER_CONTEXT)),
     ]);
 }
 
@@ -1111,6 +1147,80 @@ impl SelectItem for MicItem {
     }
 }
 
+/// The suggestions that the panel shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filter {
+    Open,
+    Confirmed,
+    Dismissed,
+    All,
+}
+
+impl Filter {
+    fn matches(self, status: SuggestionStatus) -> bool {
+        match self {
+            // A stale suggestion needs a new review, so it stays in the open list.
+            Self::Open => matches!(status, SuggestionStatus::Open | SuggestionStatus::Stale),
+            Self::Confirmed => status == SuggestionStatus::Confirmed,
+            Self::Dismissed => status == SuggestionStatus::Dismissed,
+            Self::All => true,
+        }
+    }
+}
+
+/// One filter in the filter select.
+#[derive(Clone)]
+struct FilterItem {
+    filter: Filter,
+    title: SharedString,
+}
+
+impl SelectItem for FilterItem {
+    type Value = Filter;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &Filter {
+        &self.filter
+    }
+}
+
+fn filter_items() -> Vec<FilterItem> {
+    [
+        (Filter::Open, "Abiertas"),
+        (Filter::Confirmed, "Confirmadas"),
+        (Filter::Dismissed, "Descartadas"),
+        (Filter::All, "Todas"),
+    ]
+    .into_iter()
+    .map(|(filter, title)| FilterItem {
+        filter,
+        title: title.into(),
+    })
+    .collect()
+}
+
+/// The user selects the source of a suggestion: the app shows the evidence at the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenEvidence {
+    pub evidence_id: i64,
+    pub page: u32,
+}
+
+/// An analysis model and its files, or `None` when it is not installed.
+type AnalysisFiles = (&'static AnalysisModel, Option<Vec<PathBuf>>);
+
+/// The analysis while the switch "Analizar en vivo" is on.
+struct Review {
+    queue: JobQueue,
+    /// The analysis task. `None` while the models load: the queue keeps the segments.
+    task: Option<Task<()>>,
+    /// Stops the analysis of the current segment when the switch turns off.
+    cancel: Arc<AtomicBool>,
+}
+
 /// The text of the open segment.
 struct PartialRow {
     segment_id: i64,
@@ -1153,8 +1263,37 @@ pub struct HearingsView {
     transcript_scroll: ScrollHandle,
     /// True when new text arrived while the user reads earlier text.
     new_text: bool,
+    /// The files of each analysis model, or `None` for a model that is not installed. `None`
+    /// while Nicolaw looks for them.
+    analysis_models: Option<Vec<AnalysisFiles>>,
+    /// The key of the analysis model that downloads now, and the progress in percent.
+    analysis_download: Option<(&'static str, f32)>,
+    /// The switch "Analizar en vivo".
+    live_analysis: bool,
+    review: Option<Review>,
+    /// The segments that wait for analysis, and the segments that the full queue dropped.
+    review_pending: usize,
+    review_dropped: u64,
+    /// Allows one copy of the analysis models at a time.
+    model_gate: ModelGate,
+    /// The suggestions of the selected hearing: open first, then newest first.
+    suggestions: Vec<Suggestion>,
+    counts: SuggestionCounts,
+    /// The analysis state of each segment of the accused in the selected hearing.
+    analysis_states: HashMap<i64, AnalysisState>,
+    /// The suggestions whose full evidence passage shows.
+    full_quotes: HashSet<i64>,
+    /// True while the suggestions drawer of a narrow window is open.
+    suggestions_open: bool,
+    /// The button that opens the drawer, and the drawer. Escape gives the focus back to the
+    /// button.
+    trigger_focus: FocusHandle,
+    drawer_focus: FocusHandle,
+    filter_select: Entity<SelectState<Vec<FilterItem>>>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<OpenEvidence> for HearingsView {}
 
 impl HearingsView {
     pub fn new(
@@ -1166,7 +1305,22 @@ impl HearingsView {
     ) -> Self {
         let model_select = cx.new(|cx| SelectState::new(Vec::<ModelItem>::new(), None, window, cx));
         let mic_select = cx.new(|cx| SelectState::new(Vec::<MicItem>::new(), None, window, cx));
+        // The analysis models must be free before the process exits.
+        let quit = cx.on_app_quit(|this, _| {
+            this.stop_review();
+            async {}
+        });
+        let filter_select = cx.new(|cx| {
+            let mut select = SelectState::new(filter_items(), None, window, cx);
+            select.set_selected_value(&Filter::Open, window, cx);
+            select
+        });
         let subscriptions = vec![
+            quit,
+            cx.subscribe(
+                &filter_select,
+                |_, _, _: &SelectEvent<Vec<FilterItem>>, cx| cx.notify(),
+            ),
             cx.subscribe_in(&recording, window, |this, _, event, window, cx| {
                 this.on_recording(event.clone(), window, cx)
             }),
@@ -1203,10 +1357,26 @@ impl HearingsView {
             note_task: None,
             transcript_scroll: ScrollHandle::new(),
             new_text: false,
+            analysis_models: None,
+            analysis_download: None,
+            live_analysis: true,
+            review: None,
+            review_pending: 0,
+            review_dropped: 0,
+            model_gate: ModelGate::default(),
+            suggestions: Vec::new(),
+            counts: SuggestionCounts::default(),
+            analysis_states: HashMap::new(),
+            full_quotes: HashSet::new(),
+            suggestions_open: false,
+            trigger_focus: cx.focus_handle(),
+            drawer_focus: cx.focus_handle(),
+            filter_select,
             _subscriptions: subscriptions,
         };
         view.load_models(window, cx);
         view.load_microphones(window, cx);
+        view.load_analysis_models(cx);
         view
     }
 
@@ -1259,18 +1429,34 @@ impl HearingsView {
         self.partial = None;
         self.message = None;
         self.new_text = false;
+        self.suggestions.clear();
+        self.counts = SuggestionCounts::default();
+        self.analysis_states.clear();
+        self.full_quotes.clear();
     }
 
     fn on_recording(&mut self, event: RecordingEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             RecordingEvent::Audio {
-                hearing_id, event, ..
-            } => self.apply(hearing_id, event, cx),
-            RecordingEvent::Started { .. } => self.load_hearings(None, window, cx),
+                hearing_id,
+                case_id,
+                event,
+            } => self.apply(hearing_id, case_id, event, cx),
+            RecordingEvent::Started { hearing_id } => {
+                if self.selected == Some(hearing_id) {
+                    self.set_filter(Filter::Open, window, cx);
+                }
+                self.start_review(cx);
+                self.load_hearings(None, window, cx);
+            }
             RecordingEvent::Failed(error) => self.show_error(error, cx),
-            RecordingEvent::Saved { result, .. } => {
+            RecordingEvent::Saved { hearing_id, result } => {
                 if result.is_err() {
                     self.message = Some(SAVE_ERROR.into());
+                }
+                self.stop_review_when_idle(cx);
+                if self.selected == Some(hearing_id) {
+                    self.set_filter(Filter::All, window, cx);
                 }
                 self.load_hearings(None, window, cx);
             }
@@ -1444,6 +1630,11 @@ impl HearingsView {
         }
         self.clear_selection();
         self.selected = Some(id);
+        // During the recording, the panel is a queue of open suggestions. After it, the panel
+        // lists all of them.
+        let live = self.recording.read(cx).live_hearing() == Some(id);
+        self.set_filter(if live { Filter::Open } else { Filter::All }, window, cx);
+        self.load_suggestions(id, cx);
         cx.notify();
         self.load_segments(id, window, cx);
     }
@@ -1452,7 +1643,10 @@ impl HearingsView {
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
             let segments = cx
-                .background_spawn(async move { store.lock().unwrap().segments(id) })
+                .background_spawn(async move {
+                    let store = store.lock().unwrap();
+                    Ok::<_, rusqlite::Error>((store.segments(id)?, store.analysis_states(id)?))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.selected != Some(id) {
@@ -1460,7 +1654,11 @@ impl HearingsView {
                 }
                 match segments {
                     // A segment that is still open shows as the partial row, not in the list.
-                    Ok(segments) => {
+                    Ok((segments, states)) => {
+                        // A state that changed while the list loaded is already in the view.
+                        for (segment, state) in states {
+                            this.analysis_states.entry(segment).or_insert(state);
+                        }
                         let open = this.partial.as_ref().map(|partial| partial.segment_id);
                         let mut loaded: Vec<Segment> = segments
                             .into_iter()
@@ -1669,7 +1867,21 @@ impl HearingsView {
     }
 
     /// Shows the events of a recording or a refine pass in the transcript.
-    fn apply(&mut self, hearing_id: i64, event: Event, cx: &mut Context<Self>) {
+    fn apply(&mut self, hearing_id: i64, case_id: i64, event: Event, cx: &mut Context<Self>) {
+        // A final answer of the accused waits for analysis. A refined text replaces the live
+        // text, so the segment waits again (the analysis checks the speaker).
+        match &event {
+            Event::Final(segment) if segment.speaker == Speaker::Accused => {
+                self.enqueue(case_id, hearing_id, segment.id, &segment.text)
+            }
+            Event::Refined { segment_id, text } => {
+                self.enqueue(case_id, hearing_id, *segment_id, text)
+            }
+            Event::SpeakerChanged { segment_id } => {
+                self.speaker_changed(case_id, hearing_id, *segment_id, cx)
+            }
+            _ => {}
+        }
         let shown = self.selected == Some(hearing_id);
         match event {
             Event::Partial {
@@ -1769,7 +1981,7 @@ impl HearingsView {
     }
 
     fn toggle_speaker(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(hearing_id) = self.selected else {
+        let (Some(hearing_id), Some(case_id)) = (self.selected, self.case_id) else {
             return;
         };
         let Some(segment) = self.segments.iter_mut().find(|segment| segment.id == id) else {
@@ -1797,7 +2009,12 @@ impl HearingsView {
                     return;
                 }
                 this.show_note("Hablante corregido.", cx);
-                this.apply(hearing_id, Event::SpeakerChanged { segment_id: id }, cx);
+                this.apply(
+                    hearing_id,
+                    case_id,
+                    Event::SpeakerChanged { segment_id: id },
+                    cx,
+                );
             })
             .ok();
         })
@@ -1891,6 +2108,429 @@ impl HearingsView {
         });
     }
 
+    fn set_filter(&mut self, filter: Filter, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_select.update(cx, |select, cx| {
+            select.set_selected_value(&filter, window, cx)
+        });
+    }
+
+    fn filter(&self, cx: &App) -> Filter {
+        self.filter_select
+            .read(cx)
+            .selected_value()
+            .copied()
+            .unwrap_or(Filter::All)
+    }
+
+    /// Reads the suggestions of the selected hearing again. A deleted evidence file removes its
+    /// suggestions from the store.
+    pub fn reload_suggestions(&self, cx: &mut Context<Self>) {
+        if let Some(hearing_id) = self.selected {
+            self.load_suggestions(hearing_id, cx);
+        }
+    }
+
+    /// Reads the suggestions of the hearing and their counts from the store.
+    fn load_suggestions(&self, hearing_id: i64, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    let store = store.lock().unwrap();
+                    Ok::<_, rusqlite::Error>((
+                        store.suggestions(hearing_id)?,
+                        store.suggestion_counts(hearing_id)?,
+                    ))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.selected != Some(hearing_id) {
+                    return;
+                }
+                match loaded {
+                    Ok((suggestions, counts)) => {
+                        this.suggestions = suggestions;
+                        this.counts = counts;
+                    }
+                    Err(_) => this.message = Some(LIST_ERROR.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_suggestion_status(&mut self, id: i64, status: SuggestionStatus, cx: &mut Context<Self>) {
+        let Some(hearing_id) = self.selected else {
+            return;
+        };
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(
+                    async move { store.lock().unwrap().set_suggestion_status(id, status) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                if saved.is_err() {
+                    this.message = Some(SUGGESTION_ERROR.into());
+                }
+                this.load_suggestions(hearing_id, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Looks for the files of the analysis models. Starts the analysis if a recording runs.
+    fn load_analysis_models(&self, cx: &mut Context<Self>) {
+        let dirs = self.env.model_dirs.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    ANALYSIS_MODELS
+                        .iter()
+                        .map(|&model| (model, models::find_files(&dirs, model)))
+                        .collect()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.analysis_models = Some(found);
+                if this.recording.read(cx).live().is_some() {
+                    this.start_review(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The files of the NLI model and of the language model, if both are installed.
+    fn analysis_files(&self) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let models = self.analysis_models.as_ref()?;
+        let files = |key: &str| {
+            models
+                .iter()
+                .find(|(model, _)| model.key == key)
+                .and_then(|(_, files)| files.clone())
+        };
+        Some((files(models::NLI.key)?, files(models::LLM.key)?))
+    }
+
+    fn missing_analysis_models(&self) -> Vec<&'static AnalysisModel> {
+        self.analysis_models
+            .iter()
+            .flatten()
+            .filter(|(_, files)| files.is_none())
+            .map(|(model, _)| *model)
+            .collect()
+    }
+
+    /// True when the switch is on and the analysis models are installed.
+    fn analysis_on(&self) -> bool {
+        self.live_analysis && self.analysis_files().is_some()
+    }
+
+    /// Starts the analysis, if the switch is on and it does not run.
+    fn start_review(&mut self, cx: &mut Context<Self>) {
+        if self.live_analysis {
+            self.run_review(cx);
+        }
+    }
+
+    /// Starts the analysis if it does not run, also with the switch off (for Reintentar). The
+    /// models load in the background; the queue keeps the segments until they are ready. A
+    /// new load waits until the models of the last load are free.
+    fn run_review(&mut self, cx: &mut Context<Self>) {
+        if self.review.is_some() {
+            return;
+        }
+        let Some((nli, llm)) = self.analysis_files() else {
+            return;
+        };
+        let queue = JobQueue::new(REVIEW_QUEUE);
+        self.review = Some(Review {
+            queue: queue.clone(),
+            task: None,
+            cancel: Arc::default(),
+        });
+        let backend = self.env.review.clone();
+        let gate = self.model_gate.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    let permit = gate.acquire().await;
+                    // The files can be gone since the last look.
+                    let present = nli.iter().chain(&llm).all(|path| path.is_file());
+                    // The models go before the permit when the pair is dropped.
+                    present.then(|| backend.load(&nli, &llm).map(|engines| (engines, permit)))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // The switch can turn off while the models load.
+                let Some(review) = this
+                    .review
+                    .as_mut()
+                    .filter(|review| review.queue.same(&queue))
+                else {
+                    return;
+                };
+                match loaded {
+                    None => {
+                        this.review = None;
+                        this.apply_review(ReviewEvent::ModelsMissing, cx);
+                    }
+                    Some(Ok((engines, permit))) => {
+                        let (events, receiver) = async_channel::unbounded();
+                        let analyzer = Analyzer::new(this.store.clone(), engines)
+                            .with_cancel(review.cancel.clone())
+                            .with_permit(permit);
+                        review.task =
+                            Some(cx.background_spawn(analyzer::run(analyzer, queue, events)));
+                        this.listen_review(receiver, cx);
+                    }
+                    // The files passed the check at discovery, so the cause can be the GPU or
+                    // the memory: the files are not labeled damaged.
+                    Some(Err(error)) => {
+                        this.review = None;
+                        this.message = Some(error.message().into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops the analysis and frees its models. The segments in the queue are not analyzed:
+    /// they are `skipped`.
+    fn stop_review(&mut self) {
+        if let Some(review) = self.review.take() {
+            review.queue.close();
+            review.cancel.store(true, Ordering::Relaxed);
+            let store = self.store.lock().unwrap();
+            for job in review.queue.drain() {
+                if store
+                    .set_analysis_state(job.segment_id, None, AnalysisState::Skipped)
+                    .is_ok()
+                    && self.selected == Some(job.hearing_id)
+                {
+                    self.analysis_states
+                        .insert(job.segment_id, AnalysisState::Skipped);
+                }
+            }
+        }
+        self.review_pending = 0;
+    }
+
+    /// Stops the analysis when no recording runs and no segment waits, so that the models are
+    /// free between hearings.
+    fn stop_review_when_idle(&mut self, cx: &App) {
+        let idle = self.review.as_ref().is_some_and(|review| {
+            review.queue.pending() == 0 && (review.task.is_none() || self.review_pending == 0)
+        });
+        if idle && self.recording.read(cx).live().is_none() {
+            self.stop_review();
+        }
+    }
+
+    fn listen_review(
+        &mut self,
+        events: async_channel::Receiver<ReviewEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this
+                    .update(cx, |this, cx| this.apply_review(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Puts the segment into the analysis queue, or marks it `skipped` when no analysis runs.
+    fn enqueue(&mut self, case_id: i64, hearing_id: i64, segment_id: i64, text: &str) {
+        let job = Job {
+            case_id,
+            hearing_id,
+            segment_id,
+            text_hash: text_hash(text),
+        };
+        let queue = self.review.as_ref().map(|review| &review.queue);
+        match analyzer::submit(&self.store, queue, job) {
+            Ok(changed) => {
+                for (job, state) in changed {
+                    if self.selected == Some(job.hearing_id) {
+                        self.analysis_states.insert(job.segment_id, state);
+                    }
+                }
+            }
+            Err(_) => self.message = Some(ReviewError::Storage.message().into()),
+        }
+    }
+
+    /// Analyzes the segment again, after the hearing. The models load for it and are free
+    /// again after it.
+    fn retry_analysis(&mut self, segment_id: i64, cx: &mut Context<Self>) {
+        let (Some(hearing_id), Some(case_id)) = (self.selected, self.case_id) else {
+            return;
+        };
+        let Some(text) = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .map(|segment| segment.text.clone())
+        else {
+            return;
+        };
+        self.run_review(cx);
+        self.enqueue(case_id, hearing_id, segment_id, &text);
+        cx.notify();
+    }
+
+    /// A corrected speaker changes the analysis of the segment. Other → Accused: the segment
+    /// waits for analysis. Accused → Other: its open suggestions become stale.
+    fn speaker_changed(
+        &mut self,
+        case_id: i64,
+        hearing_id: i64,
+        segment_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .cloned()
+        else {
+            return;
+        };
+        match segment.speaker {
+            Speaker::Accused => {
+                if segment.failed {
+                    return;
+                }
+                self.start_review(cx);
+                self.enqueue(case_id, hearing_id, segment_id, &segment.text);
+            }
+            Speaker::Other => {
+                self.analysis_states.remove(&segment_id);
+                let store = self.store.clone();
+                cx.spawn(async move |this, cx| {
+                    let marked = cx
+                        .background_spawn(
+                            async move { store.lock().unwrap().mark_stale(segment_id) },
+                        )
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if marked.is_err() {
+                            this.message = Some(SUGGESTION_ERROR.into());
+                        }
+                        this.load_suggestions(hearing_id, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn apply_review(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
+        match event {
+            ReviewEvent::SuggestionAdded(suggestion) => {
+                if self.selected == Some(suggestion.hearing_id) {
+                    self.load_suggestions(suggestion.hearing_id, cx);
+                }
+            }
+            ReviewEvent::Analyzed {
+                hearing_id,
+                segment_id,
+                state,
+            } => {
+                if self.selected == Some(hearing_id) {
+                    self.analysis_states.insert(segment_id, state);
+                    // Earlier suggestions of the segment can be stale now.
+                    self.load_suggestions(hearing_id, cx);
+                }
+            }
+            ReviewEvent::Progress { pending, dropped } => {
+                self.review_pending = pending;
+                self.review_dropped = dropped;
+                if pending == 0 {
+                    self.stop_review_when_idle(cx);
+                }
+            }
+            // The files are gone: look again, so that the panel offers the downloads.
+            ReviewEvent::ModelsMissing => self.load_analysis_models(cx),
+            ReviewEvent::Error(message) => self.message = Some(message.into()),
+        }
+        cx.notify();
+    }
+
+    fn toggle_live_analysis(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.live_analysis = on;
+        if !on {
+            self.stop_review();
+        } else if self.recording.read(cx).live().is_some() {
+            self.start_review(cx);
+        }
+        cx.notify();
+    }
+
+    /// Downloads the files of one analysis model.
+    fn download_analysis_model(
+        &mut self,
+        model: &'static AnalysisModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.analysis_download.is_some() {
+            return;
+        }
+        self.analysis_download = Some((model.key, 0.0));
+        cx.notify();
+        let dirs = self.env.model_dirs.clone();
+        let (sender, receiver) = async_channel::unbounded();
+        let job = cx.background_spawn(async move {
+            let mut last = 0;
+            models::download_files(model, &dirs, |part| {
+                // One update for each whole percent is enough for the progress bar.
+                let percent = (part * 100.0) as u32;
+                if percent != last {
+                    last = percent;
+                    sender.try_send(percent as f32).ok();
+                }
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(percent) = receiver.recv().await {
+                this.update(cx, |this, cx| {
+                    this.analysis_download = Some((model.key, percent.min(100.)));
+                    cx.notify();
+                })
+                .ok();
+            }
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                this.analysis_download = None;
+                if result.is_err() {
+                    this.message = Some(DOWNLOAD_ERROR.into());
+                }
+                this.load_analysis_models(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(hearing) = self.selected_hearing().cloned() else {
             return;
@@ -1957,6 +2597,38 @@ impl HearingsView {
                 .size(px(300.))
                 .child(this.read(cx).render_list_body(view.clone(), true, cx))
         });
+    }
+
+    /// Opens the suggestions drawer over the transcript, and moves the focus into it.
+    fn open_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.suggestions_open = true;
+        window.focus(&self.drawer_focus, cx);
+        cx.notify();
+    }
+
+    /// Closes the suggestions drawer, and gives the focus back to its button.
+    fn close_suggestions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.suggestions_open {
+            return;
+        }
+        self.suggestions_open = false;
+        window.focus(&self.trigger_focus, cx);
+        cx.notify();
+    }
+
+    /// Scrolls the transcript to the statement of a suggestion. In a narrow window, the
+    /// drawer closes so that the statement shows.
+    fn show_statement(&mut self, segment_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.id == segment_id)
+        else {
+            return;
+        };
+        self.close_suggestions(window, cx);
+        self.transcript_scroll.scroll_to_item(index);
+        cx.notify();
     }
 
     /// The new hearing button and the hearing rows. In the drawer, a selection closes it.
@@ -2130,6 +2802,34 @@ impl HearingsView {
                         cx.notify();
                     })),
             )
+            .children(hearing.filter(|_| narrow).map(|_| {
+                let open = self.counts.conflict + self.counts.check;
+                // The wrapper has the focus, so that Escape in the drawer gives it back.
+                div()
+                    .id("suggestions-trigger")
+                    .flex_none()
+                    .rounded(cx.theme().radius)
+                    .track_focus(&self.trigger_focus)
+                    .tab_stop(true)
+                    .key_context(TRIGGER_CONTEXT)
+                    .on_action(cx.listener(|this, _: &OpenSuggestions, window, cx| {
+                        this.open_suggestions(window, cx)
+                    }))
+                    .focus_visible(|style| style.bg(cx.theme().accent))
+                    .child(
+                        Button::new("suggestions-drawer")
+                            .outline()
+                            .small()
+                            .tab_stop(false)
+                            .label(format!("Sugerencias ({open})"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_suggestions(window, cx)
+                                }),
+                            ),
+                    )
+                    .test_support()
+            }))
             .children(hearing.map(|hearing| {
                 Button::new("delete-hearing")
                     .ghost()
@@ -2485,10 +3185,15 @@ impl HearingsView {
                 segment.speaker,
                 None,
                 text,
-                toggle,
+                toggle
+                    .map(IntoElement::into_any_element)
+                    .into_iter()
+                    .chain(self.render_analysis_state(segment, cx))
+                    .collect(),
                 muted,
             )
         });
+        let rows: Vec<AnyElement> = rows.collect();
         let partial = self.partial.as_ref().map(|partial| {
             let text = format!("{}{}", partial.committed, partial.tentative);
             let tentative = partial.committed.len()..text.len();
@@ -2506,7 +3211,7 @@ impl HearingsView {
                             ..Default::default()
                         },
                     )])),
-                None,
+                Vec::new(),
                 muted,
             )
         });
@@ -2546,7 +3251,524 @@ impl HearingsView {
     }
 }
 
-/// One transcript item: a small row with the time, the speaker, and the correction action,
+impl HearingsView {
+    /// The suggestions panel: counters, the live analysis switch, the analysis models, the
+    /// filter, and the cards. Only the cards scroll. In a narrow window, the panel is the
+    /// content of the drawer, with a close button.
+    fn render_suggestions(&self, drawer: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let installed = self.analysis_files().is_some();
+        let filter = self.filter(cx);
+        let cards: Vec<AnyElement> = self
+            .suggestions
+            .iter()
+            .filter(|suggestion| filter.matches(suggestion.status))
+            .map(|suggestion| self.render_card(suggestion, drawer, cx))
+            .collect();
+        let empty = cards.is_empty().then(|| {
+            let text = if self.suggestions.is_empty() || filter == Filter::Open {
+                NO_OPEN_SUGGESTIONS
+            } else {
+                "No hay sugerencias con este filtro."
+            };
+            div()
+                .id("suggestions-empty")
+                .text_sm()
+                .text_color(muted)
+                .child(text)
+                .test_support()
+        });
+        let missing = self.missing_analysis_models();
+        let models = (!missing.is_empty()).then(|| {
+            v_flex()
+                .id("analysis-models")
+                .gap_2()
+                .child(div().text_sm().child(
+                    "Faltan los modelos de análisis. Nicolaw graba y transcribe la audiencia sin \
+                     ellos.",
+                ))
+                .children(missing.into_iter().map(|model| {
+                    let download = self
+                        .analysis_download
+                        .filter(|(key, _)| *key == model.key)
+                        .map(|(_, percent)| percent);
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_xs().text_color(muted).child(format!(
+                                    "{} · {} MB",
+                                    model.name,
+                                    model.size_mb()
+                                )))
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "download-{}",
+                                        model.key
+                                    )))
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::ArrowDown)
+                                    .label("Descargar")
+                                    .loading(download.is_some())
+                                    .disabled(self.analysis_download.is_some())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.download_analysis_model(model, window, cx)
+                                    })),
+                                ),
+                        )
+                        .children(download.map(|percent| {
+                            Progress::new(SharedString::from(format!(
+                                "download-{}-progress",
+                                model.key
+                            )))
+                            .value(percent)
+                            .accessibility_label("Descarga")
+                        }))
+                }))
+        });
+        let loading = self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.task.is_none());
+        // "La grabación continúa" only when the capture of this hearing is healthy.
+        let recording = self.recording.read(cx).live();
+        let live = recording.is_some_and(|live| Some(live.hearing_id) == self.selected);
+        let capture_ok = recording.is_some_and(|live| live.health == Health::Ok && !live.paused);
+        let status = if loading {
+            Some(if capture_ok {
+                "Cargando análisis. La grabación continúa.".to_owned()
+            } else {
+                "Cargando análisis.".to_owned()
+            })
+        } else if live && !self.analysis_on() {
+            Some(if capture_ok {
+                "Análisis desactivado. La grabación continúa.".to_owned()
+            } else {
+                "Análisis desactivado.".to_owned()
+            })
+        } else if self.review_pending > 0 {
+            Some(format!(
+                "Declaraciones en análisis: {}",
+                self.review_pending
+            ))
+        } else {
+            None
+        };
+        let dropped = (self.review_dropped > 0).then(|| {
+            format!(
+                "Nicolaw no analizó {} declaraciones. Había demasiadas en espera.",
+                self.review_dropped
+            )
+        });
+
+        let close = drawer.then(|| {
+            Button::new("suggestions-close")
+                .ghost()
+                .small()
+                .icon(IconName::Close)
+                .tooltip("Cerrar")
+                .on_click(cx.listener(|this, _, window, cx| this.close_suggestions(window, cx)))
+        });
+
+        v_flex()
+            .id("suggestions-panel")
+            .flex_none()
+            .map(|panel| {
+                if drawer {
+                    panel.w_full()
+                } else {
+                    panel.w(px(PANEL_WIDTH))
+                }
+            })
+            .h_full()
+            .p_3()
+            .gap_3()
+            .when(!drawer, |panel| panel.border_l_1())
+            .border_color(cx.theme().border)
+            .test_support()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().font_semibold().child("Sugerencias"))
+                    .child(div().flex_none().text_xs().text_color(muted).child(format!(
+                        "Conflictos: {} · Revisar: {}",
+                        self.counts.conflict, self.counts.check
+                    )))
+                    .children(close),
+            )
+            .child(
+                Switch::new("live-analysis")
+                    .label("Analizar en vivo")
+                    .checked(self.analysis_on())
+                    .disabled(!installed)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.toggle_live_analysis(*checked, cx)
+                    })),
+            )
+            .children(models)
+            .children(
+                status
+                    .into_iter()
+                    .chain(dropped)
+                    .map(|text| div().text_xs().text_color(muted).child(text)),
+            )
+            .child(
+                // Without this wrapper, the select grows in the column.
+                div()
+                    .id("suggestion-filter-box")
+                    .flex_none()
+                    .test_support()
+                    .child(
+                        Select::new(&self.filter_select)
+                            .id("suggestion-filter")
+                            .w_full()
+                            .accessibility_label("Filtro de sugerencias"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("suggestion-list-box")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .test_support()
+                    .child(
+                        v_flex()
+                            .id("suggestion-list")
+                            .size_full()
+                            .gap_3()
+                            .children(cards)
+                            .children(empty)
+                            .overflow_y_scrollbar(),
+                    ),
+            )
+    }
+
+    /// One suggestion: level, kind, the claim with the conflicting words in bold, the
+    /// evidence passage with its file and page, the explanation, and the decision buttons.
+    fn render_card(
+        &self,
+        suggestion: &Suggestion,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let id = suggestion.id;
+        let level = match suggestion.level {
+            SuggestionLevel::Conflict => Tag::danger().small().child("Posible conflicto"),
+            SuggestionLevel::Check => Tag::warning().small().child("Revisar"),
+        };
+        let status = match suggestion.status {
+            SuggestionStatus::Open => None,
+            SuggestionStatus::Confirmed => Some(Tag::success().small().child("Confirmada")),
+            SuggestionStatus::Dismissed => Some(Tag::secondary().small().child("Descartada")),
+            SuggestionStatus::Stale => Some(Tag::secondary().small().child("Desactualizada")),
+        };
+        let stale = (suggestion.status == SuggestionStatus::Stale).then(|| {
+            div()
+                .id(("stale-note", id as u64))
+                .text_xs()
+                .text_color(muted)
+                .child(self.stale_note(suggestion))
+                .test_support()
+        });
+        let quote = suggestion.claim_quote.as_deref().and_then(|quote| {
+            let start = suggestion.claim.find(quote)?;
+            Some(start..start + quote.len())
+        });
+        let claim = StyledText::new(suggestion.claim.clone()).with_highlights(quote.map(|range| {
+            (
+                range,
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: None,
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+        }));
+        let source = OpenEvidence {
+            evidence_id: suggestion.evidence_id,
+            page: suggestion.page,
+        };
+        let label = |text: &'static str| div().text_xs().text_color(muted).child(text);
+        let segment_id = suggestion.segment_id;
+        let statement_time = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .map(|segment| format_time(segment.t_start_ms));
+        let (quote, short) = if self.full_quotes.contains(&id) {
+            (suggestion.evidence_quote.clone(), false)
+        } else {
+            short_quote(&suggestion.evidence_quote)
+        };
+        // The file name can be cut, the locator never: in a narrow window it has its own line.
+        let name = suggestion.evidence_name.clone();
+        let file = div()
+            .id(("source-name", id as u64))
+            .min_w_0()
+            .truncate()
+            .child(name.clone())
+            .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+            .test_support();
+        let locator = div()
+            .id(("source-locator", id as u64))
+            .flex_none()
+            .child(locator_label(&suggestion.evidence_mime, suggestion.page))
+            .test_support();
+        let open = Button::new(("source", id as u64))
+            .link()
+            .xsmall()
+            .flex_none()
+            .label("Abrir fuente")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // The evidence screen replaces this screen: the drawer is closed on return.
+                this.suggestions_open = false;
+                cx.emit(source)
+            }));
+        let source_row = if narrow {
+            v_flex()
+                .gap_1()
+                .text_xs()
+                .text_color(muted)
+                .child(file)
+                .child(h_flex().gap_2().items_center().child(locator).child(open))
+                .into_any_element()
+        } else {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(file.flex_1())
+                .child(locator)
+                .child(open)
+                .into_any_element()
+        };
+
+        v_flex()
+            .id(("suggestion", id as u64))
+            .gap_2()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(level)
+                    .children(
+                        suggestion
+                            .kind
+                            .map(|kind| div().text_xs().text_color(muted).child(kind_label(kind))),
+                    )
+                    .children(status),
+            )
+            .children(stale)
+            .child(
+                // The claim is a sentence that the language model wrote, not a quote: the
+                // statement and its time are one click away.
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(label("Afirmación extraída"))
+                    .children(statement_time.clone().map(|time| {
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Declaración {time}"))
+                    }))
+                    .children(statement_time.map(|_| {
+                        Button::new(("show-statement", id as u64))
+                            .link()
+                            .xsmall()
+                            .label("Ver declaración")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.show_statement(segment_id, window, cx)
+                            }))
+                    })),
+            )
+            .child(div().text_sm().child(claim))
+            .child(label("Prueba"))
+            .child(
+                div()
+                    .id(("quote", id as u64))
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(cx.theme().border)
+                    .text_sm()
+                    .child(format!("«{quote}»"))
+                    .test_support(),
+            )
+            .children(short.then(|| {
+                Button::new(("full-quote", id as u64))
+                    .link()
+                    .xsmall()
+                    .label("Ver pasaje completo")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.full_quotes.insert(id);
+                        cx.notify();
+                    }))
+            }))
+            .child(source_row)
+            .children(
+                suggestion
+                    .explanation
+                    .clone()
+                    .map(|explanation| div().text_sm().child(explanation)),
+            )
+            .when(suggestion.status == SuggestionStatus::Open, |card| {
+                card.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(("confirm", id as u64))
+                                .primary()
+                                .small()
+                                .label("Confirmar")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_suggestion_status(id, SuggestionStatus::Confirmed, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("dismiss", id as u64))
+                                .ghost()
+                                .small()
+                                .label("Descartar")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_suggestion_status(id, SuggestionStatus::Dismissed, cx)
+                                })),
+                        ),
+                )
+            })
+            // A stale suggestion is about an earlier text or speaker: it can only be dismissed.
+            .when(suggestion.status == SuggestionStatus::Stale, |card| {
+                card.child(
+                    Button::new(("dismiss", id as u64))
+                        .ghost()
+                        .small()
+                        .label("Descartar")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_suggestion_status(id, SuggestionStatus::Dismissed, cx)
+                        })),
+                )
+            })
+            .test_support()
+            .into_any_element()
+    }
+
+    /// Why a suggestion is stale: the text changed after the analysis, or the speaker.
+    fn stale_note(&self, suggestion: &Suggestion) -> &'static str {
+        let text_changed = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == suggestion.segment_id)
+            .is_some_and(|segment| segment.revision > suggestion.segment_revision);
+        if text_changed {
+            STALE_TEXT
+        } else {
+            STALE_SPEAKER
+        }
+    }
+
+    /// The analysis state of a statement of the accused, as a quiet tag, with Reintentar
+    /// after the hearing when the statement was not analyzed.
+    fn render_analysis_state(
+        &self,
+        segment: &Segment,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if segment.speaker != Speaker::Accused || segment.failed {
+            return None;
+        }
+        let id = segment.id;
+        let mut state = *self.analysis_states.get(&id)?;
+        let live = self.recording.read(cx).live_hearing() == self.selected;
+        // A segment that waits when no analysis runs is not analyzed, for example after a
+        // restart of the app.
+        if state == AnalysisState::Waiting && self.review.is_none() {
+            state = AnalysisState::Skipped;
+        }
+        let retry = (matches!(state, AnalysisState::Skipped | AnalysisState::Failed)
+            && !live
+            && self.analysis_files().is_some())
+        .then(|| {
+            Button::new(("retry-analysis", id as u64))
+                .ghost()
+                .xsmall()
+                .label("Reintentar")
+                .on_click(cx.listener(move |this, _, _, cx| this.retry_analysis(id, cx)))
+        });
+        let tag = if state == AnalysisState::Failed {
+            Tag::warning()
+        } else {
+            Tag::secondary()
+        };
+        Some(
+            h_flex()
+                .id(("analysis-state", id as u64))
+                .gap_1()
+                .items_center()
+                .child(tag.small().child(analysis_label(state)))
+                .children(retry)
+                .test_support()
+                .into_any_element(),
+        )
+    }
+}
+
+/// The start of a long evidence passage, cut after a word, and true if it was cut.
+fn short_quote(quote: &str) -> (String, bool) {
+    if quote.chars().count() <= SHORT_QUOTE {
+        return (quote.to_owned(), false);
+    }
+    let end = quote
+        .char_indices()
+        .nth(SHORT_QUOTE)
+        .map_or(quote.len(), |(index, _)| index);
+    let cut = quote[..end].rfind(' ').unwrap_or(end);
+    (format!("{}…", quote[..cut].trim_end()), true)
+}
+
+/// The text of an analysis state, for the transcript.
+pub fn analysis_label(state: AnalysisState) -> &'static str {
+    match state {
+        AnalysisState::Waiting => "Análisis pendiente",
+        AnalysisState::Complete => "Analizado",
+        AnalysisState::NoClaim => "Sin afirmaciones verificables",
+        AnalysisState::NoSource => {
+            "No se encontró un pasaje para comparar. Esto no confirma la declaración."
+        }
+        AnalysisState::Failed => "Análisis fallido",
+        AnalysisState::Skipped => "Esta declaración no se analizó.",
+    }
+}
+
+pub fn kind_label(kind: SuggestionKind) -> &'static str {
+    match kind {
+        SuggestionKind::Date => "Fecha",
+        SuggestionKind::Amount => "Cantidad",
+        SuggestionKind::Identity => "Identidad",
+        SuggestionKind::Location => "Lugar",
+        SuggestionKind::Sequence => "Secuencia",
+        SuggestionKind::Other => "Otro",
+    }
+}
+
+/// One transcript item: a small row with the time, the speaker, a note, and the actions (the
+/// correction of the speaker and the analysis state),
 /// then the statement at full width.
 fn render_row(
     id: impl Into<ElementId>,
@@ -2554,7 +3776,7 @@ fn render_row(
     speaker: Speaker,
     note: Option<&'static str>,
     text: Div,
-    toggle: Option<Button>,
+    actions: Vec<AnyElement>,
     muted: Hsla,
 ) -> AnyElement {
     let tag = match speaker {
@@ -2566,14 +3788,15 @@ fn render_row(
         .gap_1()
         .child(
             h_flex()
+                .flex_wrap()
                 .gap_2()
                 .items_center()
                 .text_xs()
                 .text_color(muted)
                 .child(format_time(t_start_ms))
                 .child(tag.small().child(speaker_label(speaker)))
-                .children(toggle)
-                .children(note),
+                .children(note)
+                .children(actions),
         )
         .child(text.w_full())
         .test_support()
@@ -2597,12 +3820,42 @@ impl Render for HearingsView {
             self.new_text = false;
         }
         let narrow = window.viewport_size().width < px(NARROW_WIDTH);
+        let selected = self.selected_hearing().is_some();
+        // In a narrow window the suggestions are a drawer over the transcript, so that the
+        // transcript keeps its width. The drawer is inside this screen, so it never covers the
+        // live strip above it.
+        let drawer = (narrow && selected && self.suggestions_open).then(|| {
+            div()
+                .id("suggestions-sheet")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .w(px(PANEL_WIDTH))
+                .occlude()
+                .track_focus(&self.drawer_focus)
+                .key_context(DRAWER_CONTEXT)
+                .on_action(cx.listener(|this, _: &CloseSuggestions, window, cx| {
+                    this.close_suggestions(window, cx)
+                }))
+                .bg(cx.theme().background)
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .shadow_lg()
+                .child(self.render_suggestions(true, cx))
+                .test_support()
+        });
         h_flex()
             .id("hearings")
+            .relative()
             .size_full()
             .items_start()
             .when(!narrow, |screen| screen.child(self.render_list(cx)))
             .child(self.render_detail(narrow, cx))
+            .when(selected && !narrow, |screen| {
+                screen.child(self.render_suggestions(false, cx))
+            })
+            .children(drawer)
             .test_support()
     }
 }
@@ -2624,14 +3877,22 @@ mod tests {
     };
 
     use super::{
-        HearingsEnv, HearingsView, Recording, SAVE_ERROR, StartRecording, SwitchSpeaker,
+        Filter, HearingsEnv, HearingsView, Recording, SAVE_ERROR, StartRecording, SwitchSpeaker,
         TogglePause, format_time, register_actions, render_live_strip, speaker_label, status_text,
     };
     use crate::audio::fake::FakeBackend;
     use crate::audio::pipeline::Event;
     use crate::audio::{AudioError, Microphone, ModelPaths};
-    use crate::models::{COHERE, ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model};
-    use crate::store::{Segment, Speaker, Store};
+    use crate::extract::{Page, PageSource};
+    use crate::models::{
+        ANALYSIS_MODELS, COHERE, ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model,
+    };
+    use crate::review::ReviewEvent;
+    use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
+    use crate::store::{
+        AnalysisState, NewSuggestion, Segment, Speaker, Store, SuggestionCounts, SuggestionLevel,
+        SuggestionStatus,
+    };
 
     const WAIT: Duration = Duration::from_secs(1);
 
@@ -2700,6 +3961,41 @@ mod tests {
         )
     }
 
+    /// Opens the screen, and returns the window and the hearings view.
+    fn open_pair(
+        name: &str,
+        store: Store,
+        case: i64,
+        backend: &FakeBackend,
+        dirs: &ModelDirs,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<HearingsView>) {
+        let opened = open(name, store, case, backend, dirs, cx);
+        (opened.window, opened.view)
+    }
+
+    fn open_with(
+        name: &str,
+        store: Store,
+        case: i64,
+        backend: &FakeBackend,
+        review: &FakeReviewBackend,
+        dirs: &ModelDirs,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<HearingsView>) {
+        let opened = open_full(
+            name,
+            store,
+            case,
+            backend,
+            review,
+            dirs,
+            size(px(1100.), px(720.)),
+            cx,
+        );
+        (opened.window, opened.view)
+    }
+
     fn open_sized(
         name: &str,
         store: Store,
@@ -2709,8 +4005,24 @@ mod tests {
         window_size: gpui_kit::Size<Pixels>,
         cx: &mut TestAppContext,
     ) -> Opened {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        open_full(name, store, case, backend, &review, dirs, window_size, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_full(
+        name: &str,
+        store: Store,
+        case: i64,
+        backend: &FakeBackend,
+        review: &FakeReviewBackend,
+        dirs: &ModelDirs,
+        window_size: gpui_kit::Size<Pixels>,
+        cx: &mut TestAppContext,
+    ) -> Opened {
         let env = HearingsEnv {
             backend: Arc::new(backend.clone()),
+            review: Arc::new(review.clone()),
             model_dirs: dirs.clone(),
             data_dir: temp_dir(&format!("data-{name}")),
         };
@@ -3274,6 +4586,604 @@ mod tests {
         });
     }
 
+    const ANSWER: &str = "Ese día yo estaba en Medellín.";
+    const CLAIM: &str = "El acusado estaba en Medellín el 12 de marzo.";
+    const HOTEL: &str =
+        "Según el registro del hotel, el acusado estaba en Bogotá el 12 de marzo de 2024.";
+
+    fn nli() -> FakeNli {
+        FakeNli {
+            word: "Bogotá".into(),
+            contradiction: 0.95,
+        }
+    }
+
+    /// Writes fake files of the analysis models into the Hugging Face cache of `dirs`.
+    fn install_analysis_models(dirs: &ModelDirs) {
+        for model in ANALYSIS_MODELS {
+            for file in model.files {
+                let path = dirs
+                    .hf_cache
+                    .join(format!("models--{}", file.repo.replace('/', "--")))
+                    .join("snapshots")
+                    .join(file.revision)
+                    .join(file.file);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let content: &[u8] = if file.file.ends_with(".json") {
+                    b"{}"
+                } else {
+                    b"x"
+                };
+                fs::write(path, content).unwrap();
+            }
+        }
+    }
+
+    /// Adds the hotel register to the case. Returns the id of its chunk.
+    fn add_evidence(store: &Store, case: i64, name: &str) -> i64 {
+        let path = temp_dir(&format!("evidence-{name}")).join("registro.txt");
+        fs::write(&path, "x").unwrap();
+        let id = store.import(case, &path, |_, _| {}).unwrap().id;
+        let page = Page {
+            number: 3,
+            text: HOTEL.into(),
+            source: PageSource::Text,
+        };
+        store.save_analysis(id, &[page]).unwrap();
+        store.search(case, "hotel", 1).unwrap()[0].chunk_id
+    }
+
+    /// A hearing with one answer of the accused. Returns the hearing and the segment ids.
+    fn add_hearing(store: &Store, case: i64) -> (i64, i64) {
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store
+            .insert_segment(hearing, 1_000, Speaker::Accused)
+            .unwrap();
+        store.finish_segment(segment, ANSWER, 3_000).unwrap();
+        (hearing, segment)
+    }
+
+    fn new_suggestion(
+        hearing: i64,
+        segment: i64,
+        chunk: i64,
+        level: SuggestionLevel,
+    ) -> NewSuggestion {
+        NewSuggestion {
+            hearing_id: hearing,
+            segment_id: segment,
+            chunk_id: chunk,
+            claim: CLAIM.into(),
+            claim_quote: Some("en Medellín".into()),
+            evidence_quote: "estaba en Bogotá el 12 de marzo de 2024".into(),
+            kind: None,
+            level,
+            nli_contradiction: 0.95,
+            explanation: Some("El registro ubica al acusado en Bogotá.".into()),
+            segment_revision: 0,
+        }
+    }
+
+    async fn select_hearing(cx: &mut TestAppContext, window: AnyWindowHandle, hearing: i64) {
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+        })
+        .await;
+        click(cx, window, ("hearing", hearing as u64));
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("suggestions-panel").is_some()
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn a_suggestion_event_shows_a_card_and_updates_the_counter(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "event");
+        let (hearing, segment) = add_hearing(&store, case);
+        let dirs = model_dirs("event", true);
+        let (window, view) = open_pair("event", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("suggestions-empty").is_some()
+        })
+        .await;
+
+        let suggestion = cx.update(|cx| {
+            view.read(cx)
+                .store
+                .lock()
+                .unwrap()
+                .insert_suggestion(&new_suggestion(
+                    hearing,
+                    segment,
+                    chunk,
+                    SuggestionLevel::Conflict,
+                ))
+                .unwrap()
+        });
+        let id = suggestion.id as u64;
+        view.update(cx, |view, cx| {
+            view.apply_review(ReviewEvent::SuggestionAdded(suggestion), cx)
+        });
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("suggestion", id)).is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            assert_eq!(
+                view.read(cx).counts,
+                SuggestionCounts {
+                    conflict: 1,
+                    check: 0
+                }
+            );
+        });
+        assert!(shown(cx, window, ("confirm", id)));
+        assert!(shown(cx, window, ("source", id)));
+    }
+
+    #[gpui_kit::test]
+    async fn confirm_changes_the_status_and_the_counter(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "confirm");
+        let (hearing, segment) = add_hearing(&store, case);
+        let id = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Check,
+            ))
+            .unwrap()
+            .id;
+        let dirs = model_dirs("confirm", true);
+        let (window, view) = open_pair("confirm", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("confirm", id as u64)).is_some()
+        })
+        .await;
+        cx.update(|cx| assert_eq!(view.read(cx).counts.check, 1));
+
+        click(cx, window, ("confirm", id as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).counts.check == 0)
+            .await;
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.suggestions[0].status, SuggestionStatus::Confirmed);
+            assert_eq!(
+                view.store.lock().unwrap().suggestions(hearing).unwrap()[0].status,
+                SuggestionStatus::Confirmed
+            );
+        });
+        // The card stays (the filter shows all suggestions), without the buttons.
+        assert!(shown(cx, window, ("suggestion", id as u64)));
+        assert!(!shown(cx, window, ("confirm", id as u64)));
+        assert!(!shown(cx, window, ("dismiss", id as u64)));
+    }
+
+    #[gpui_kit::test]
+    async fn the_filter_shows_the_suggestions_with_the_selected_status(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "filter");
+        let (hearing, segment) = add_hearing(&store, case);
+        let add = |level| {
+            store
+                .insert_suggestion(&new_suggestion(hearing, segment, chunk, level))
+                .unwrap()
+                .id as u64
+        };
+        let open_id = add(SuggestionLevel::Conflict);
+        let dismissed = add(SuggestionLevel::Check);
+        store
+            .set_suggestion_status(dismissed as i64, SuggestionStatus::Dismissed)
+            .unwrap();
+        let dirs = model_dirs("filter", true);
+        let (window, view) = open_pair("filter", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("suggestion", open_id)).is_some()
+                && window.try_find(("suggestion", dismissed)).is_some()
+        })
+        .await;
+
+        for (filter, open_shown, dismissed_shown) in [
+            (Filter::Open, true, false),
+            (Filter::Dismissed, false, true),
+            (Filter::Confirmed, false, false),
+            (Filter::All, true, true),
+        ] {
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.filter_select.update(cx, |select, cx| {
+                        select.set_selected_value(&filter, window, cx)
+                    })
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+
+            assert_eq!(
+                shown(cx, window, ("suggestion", open_id)),
+                open_shown,
+                "{filter:?}"
+            );
+            assert_eq!(
+                shown(cx, window, ("suggestion", dismissed)),
+                dismissed_shown,
+                "{filter:?}"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn without_analysis_models_the_panel_offers_a_download_for_each(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, _) = add_hearing(&store, case);
+        let dirs = model_dirs("no-analysis", true);
+        let (window, view) =
+            open_pair("no-analysis", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("download-nli").is_some() && window.try_find("download-llm").is_some()
+        })
+        .await;
+        cx.update(|cx| assert!(!view.read(cx).analysis_on()));
+    }
+
+    #[gpui_kit::test]
+    async fn an_accused_answer_in_a_live_hearing_becomes_a_suggestion(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        add_evidence(&store, case, "live");
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let backend = FakeBackend::new(ANSWER);
+        let explanation = serde_json::json!({
+            "contradiction": true,
+            "kind": "location",
+            "explanation_es": "El registro ubica al acusado en Bogotá.",
+            "quote_claim": "en Medellín",
+            "quote_evidence": "estaba en Bogotá",
+        });
+        let llm = FakeLlm::new(
+            &serde_json::json!([CLAIM]).to_string(),
+            &explanation.to_string(),
+        );
+        let review = FakeReviewBackend::new(llm.clone(), nli());
+        let dirs = model_dirs("live-analysis", true);
+        install_analysis_models(&dirs);
+        let (window, view) = open_with("live", store, case, &backend, &review, &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).ready())
+            .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).analysis_on())
+            .await;
+
+        let recording = cx.update(|cx| view.read(cx).recording.clone());
+        recording.update(cx, |recording, cx| recording.switch_speaker(cx));
+        click(cx, window, "start");
+        cx.wait_for(window, WAIT, |_, _| backend.input.lock().unwrap().is_some())
+            .await;
+        backend.send(0.5, 5);
+        backend.send(0.0, 19);
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).suggestions.len() == 1)
+            .await;
+        let suggestion = cx.update(|cx| view.read(cx).suggestions[0].clone());
+        assert_eq!(suggestion.level, SuggestionLevel::Conflict);
+        assert_eq!(suggestion.claim, CLAIM);
+        assert_eq!(suggestion.page, 3);
+        assert_eq!(llm.calls()[0], format!("claims||{ANSWER}"));
+        let loaded = review.loaded.lock().unwrap().clone().unwrap();
+        assert_eq!((loaded.0.len(), loaded.1.len()), (3, 2));
+    }
+
+    /// Opens a view with installed analysis models, selects a new hearing, and starts the
+    /// recording. Returns the window, the view, and the hearing.
+    async fn record_with_analysis(
+        name: &str,
+        review: &FakeReviewBackend,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<HearingsView>, i64) {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let backend = FakeBackend::new(ANSWER);
+        let dirs = model_dirs(name, true);
+        install_analysis_models(&dirs);
+        let (window, view) = open_with(name, store, case, &backend, review, &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).ready())
+            .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).analysis_on())
+            .await;
+        click(cx, window, "start");
+        cx.wait_for(window, WAIT, |_, _| backend.input.lock().unwrap().is_some())
+            .await;
+        (window, view, hearing)
+    }
+
+    #[gpui_kit::test]
+    async fn analysis_models_that_do_not_load_are_not_labeled_damaged(cx: &mut TestAppContext) {
+        let mut review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        review.fail = true;
+
+        let (window, view, _) = record_with_analysis("analysis-broken", &review, cx).await;
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).message.is_some())
+            .await;
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(
+                view.message,
+                Some("Nicolaw no pudo cargar el modelo.".into())
+            );
+            assert!(view.review.is_none());
+            // The files are valid: the panel does not offer a download for them.
+            assert!(view.missing_analysis_models().is_empty());
+        });
+        assert!(!shown(cx, window, "download-nli"));
+        assert!(!shown(cx, window, "download-llm"));
+    }
+
+    #[gpui_kit::test]
+    async fn the_switch_off_cancels_the_running_analysis(cx: &mut TestAppContext) {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        let (window, view, _) = record_with_analysis("analysis-cancel", &review, cx).await;
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.task.is_some())
+        })
+        .await;
+        let cancel = cx.update(|cx| view.read(cx).review.as_ref().unwrap().cancel.clone());
+
+        click(cx, window, "live-analysis");
+        cx.run_until_parked();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        cx.update(|cx| assert!(view.read(cx).review.is_none()));
+    }
+
+    fn conflict_llm() -> FakeLlm {
+        let explanation = serde_json::json!({
+            "contradiction": true,
+            "kind": "location",
+            "explanation_es": "El registro ubica al acusado en Bogotá.",
+            "quote_claim": "en Medellín",
+            "quote_evidence": "estaba en Bogotá",
+        });
+        FakeLlm::new(
+            &serde_json::json!([CLAIM]).to_string(),
+            &explanation.to_string(),
+        )
+    }
+
+    /// Opens a view with installed analysis models and the hotel register in the case, and
+    /// selects the hearing.
+    async fn open_hearing_with_analysis(
+        name: &str,
+        store: Store,
+        case: i64,
+        hearing: i64,
+        review: &FakeReviewBackend,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<HearingsView>) {
+        add_evidence(&store, case, name);
+        let dirs = model_dirs(name, true);
+        install_analysis_models(&dirs);
+        let (window, view) = open_with(name, store, case, &FakeBackend::new(""), review, &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).analysis_on())
+            .await;
+        (window, view)
+    }
+
+    fn state_of(
+        view: &Entity<HearingsView>,
+        segment: i64,
+        cx: &TestAppContext,
+    ) -> Option<AnalysisState> {
+        cx.read(|cx| view.read(cx).analysis_states.get(&segment).copied())
+    }
+
+    #[gpui_kit::test]
+    async fn reintentar_analyzes_a_skipped_statement_and_frees_the_models(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, segment) = add_hearing(&store, case);
+        store
+            .set_analysis_state(segment, None, AnalysisState::Skipped)
+            .unwrap();
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+        let (window, view) =
+            open_hearing_with_analysis("retry", store, case, hearing, &review, cx).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window
+                .try_find(("retry-analysis", segment as u64))
+                .is_some()
+        })
+        .await;
+        assert!(shown(cx, window, ("analysis-state", segment as u64)));
+        assert_eq!(state_of(&view, segment, cx), Some(AnalysisState::Skipped));
+
+        click(cx, window, ("retry-analysis", segment as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx).analysis_states.get(&segment) == Some(&AnalysisState::Complete)
+        })
+        .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).suggestions.len() == 1)
+            .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).review.is_none())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(review.loads.load(Ordering::SeqCst), 1);
+        assert_eq!(review.copies.load(Ordering::SeqCst), 0);
+        assert!(!shown(cx, window, ("retry-analysis", segment as u64)));
+    }
+
+    #[gpui_kit::test]
+    async fn a_failed_analysis_and_a_missing_source_show_distinct_states(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, failed) = add_hearing(&store, case);
+        let no_source = store
+            .insert_segment(hearing, 5_000, Speaker::Accused)
+            .unwrap();
+        store
+            .finish_segment(no_source, "Tengo una bicicleta.", 6_000)
+            .unwrap();
+        store
+            .set_analysis_state(failed, None, AnalysisState::Failed)
+            .unwrap();
+        store
+            .set_analysis_state(no_source, None, AnalysisState::NoSource)
+            .unwrap();
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+
+        let (window, view) =
+            open_hearing_with_analysis("states", store, case, hearing, &review, cx).await;
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window
+                .try_find(("analysis-state", no_source as u64))
+                .is_some()
+        })
+        .await;
+        assert_eq!(state_of(&view, failed, cx), Some(AnalysisState::Failed));
+        assert_eq!(
+            state_of(&view, no_source, cx),
+            Some(AnalysisState::NoSource)
+        );
+        // A failed analysis can run again; a missing source is a complete check.
+        assert!(shown(cx, window, ("retry-analysis", failed as u64)));
+        assert!(!shown(cx, window, ("retry-analysis", no_source as u64)));
+        assert_ne!(
+            super::analysis_label(AnalysisState::NoSource),
+            super::analysis_label(AnalysisState::Complete)
+        );
+        assert!(
+            super::analysis_label(AnalysisState::NoSource).contains("no confirma"),
+            "a missing source is not agreement"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn a_statement_corrected_to_the_accused_is_analyzed(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store
+            .insert_segment(hearing, 1_000, Speaker::Other)
+            .unwrap();
+        store.finish_segment(segment, ANSWER, 3_000).unwrap();
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+        let (window, view) =
+            open_hearing_with_analysis("speaker-accused", store, case, hearing, &review, cx).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window
+                .try_find(("toggle-speaker", segment as u64))
+                .is_some()
+        })
+        .await;
+        assert!(cx.read(|cx| view.read(cx).suggestions.is_empty()));
+
+        click(cx, window, ("toggle-speaker", segment as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).suggestions.len() == 1)
+            .await;
+        assert_eq!(state_of(&view, segment, cx), Some(AnalysisState::Complete));
+        // No recording runs: the models are free after the analysis.
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).review.is_none())
+            .await;
+    }
+
+    #[gpui_kit::test]
+    async fn a_statement_corrected_to_an_other_speaker_makes_its_suggestions_stale(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "speaker-other-chunk");
+        let (hearing, segment) = add_hearing(&store, case);
+        let id = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap()
+            .id as u64;
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+        let (window, view) =
+            open_hearing_with_analysis("speaker-other", store, case, hearing, &review, cx).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("confirm", id)).is_some()
+        })
+        .await;
+
+        click(cx, window, ("toggle-speaker", segment as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .suggestions
+                .first()
+                .is_some_and(|s| s.status == SuggestionStatus::Stale)
+        })
+        .await;
+        cx.run_until_parked();
+        assert!(shown(cx, window, ("stale-note", id)));
+        assert!(!shown(cx, window, ("confirm", id)));
+        assert!(shown(cx, window, ("dismiss", id)));
+        cx.read(|cx| assert_eq!(view.read(cx).counts, SuggestionCounts::default()));
+        assert_eq!(review.loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn finalizar_frees_the_analysis_models(cx: &mut TestAppContext) {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        let (window, view, _) = record_with_analysis("finish-unload", &review, cx).await;
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.task.is_some())
+        })
+        .await;
+        assert_eq!(review.copies.load(Ordering::SeqCst), 1);
+
+        click(cx, window, "finish");
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).review.is_none())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(review.copies.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn a_quick_off_and_on_never_loads_a_second_copy(cx: &mut TestAppContext) {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        let (window, view, _) = record_with_analysis("off-on", &review, cx).await;
+
+        click(cx, window, "live-analysis");
+        click(cx, window, "live-analysis");
+        click(cx, window, "live-analysis");
+        click(cx, window, "live-analysis");
+
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.task.is_some())
+        })
+        .await;
+        cx.run_until_parked();
+        assert!(review.loads.load(Ordering::SeqCst) >= 2);
+        assert_eq!(review.max_copies.load(Ordering::SeqCst), 1);
+        assert_eq!(review.copies.load(Ordering::SeqCst), 1);
+    }
+
     #[gpui_kit::test]
     async fn a_hearing_cannot_be_deleted_while_it_records(cx: &mut TestAppContext) {
         let (store, case, id) = hearing_with_case("Audiencia");
@@ -3389,7 +5299,7 @@ mod tests {
         };
 
         opened.view.update(cx, |view, cx| {
-            view.apply(id, Event::Untranscribed(segment.clone()), cx)
+            view.apply(id, case, Event::Untranscribed(segment.clone()), cx)
         });
 
         assert!(shown(cx, opened.window, ("segment", 5u64)));
@@ -3421,7 +5331,7 @@ mod tests {
 
         opened.view.update(cx, |view, cx| {
             view.segments = vec![segment.clone()];
-            view.apply(id, Event::Final(segment.clone()), cx);
+            view.apply(id, case, Event::Final(segment.clone()), cx);
         });
 
         cx.update(|cx| assert_eq!(opened.view.read(cx).segments, [segment]));
@@ -3465,7 +5375,7 @@ mod tests {
 
         // At the end, new text scrolls into view.
         opened.view.update(cx, |view, cx| {
-            view.apply(id, Event::Final(segment(1_001)), cx)
+            view.apply(id, case, Event::Final(segment(1_001)), cx)
         });
         cx.update_window(window, |_, window, cx| window.render_frame(cx))
             .unwrap();
@@ -3482,7 +5392,7 @@ mod tests {
         .unwrap();
         let offset = cx.update(|cx| opened.view.read(cx).transcript_scroll.offset());
         opened.view.update(cx, |view, cx| {
-            view.apply(id, Event::Final(segment(1_002)), cx)
+            view.apply(id, case, Event::Final(segment(1_002)), cx)
         });
         cx.update_window(window, |_, window, cx| window.render_frame(cx))
             .unwrap();
@@ -3543,6 +5453,18 @@ mod tests {
             )
             .unwrap()
             .id;
+        // The hearing has a suggestion, so that the suggestions are available.
+        let chunk = add_evidence(&store, case, name);
+        let statement = store.insert_segment(id, 0, Speaker::Accused).unwrap();
+        store.finish_segment(statement, ANSWER, 900).unwrap();
+        store
+            .insert_suggestion(&new_suggestion(
+                id,
+                statement,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap();
         let backend = FakeBackend::new("");
         let dirs = model_dirs(name, true);
         let opened = open_sized(
@@ -3614,6 +5536,10 @@ mod tests {
         let strip = bounds(cx, opened.window, "live-strip");
         assert_eq!(strip.size.height, px(if narrow { 80. } else { 48. }));
         assert!(bounds(cx, opened.window, "speaker").size.width >= px(176.));
+        cx.wait_for(opened.window, WAIT, |_, cx| {
+            opened.view.read(cx).counts.conflict == 1
+        })
+        .await;
         let transcript = bounds(cx, opened.window, "transcript-frame");
         let reading = if narrow { 600. } else { 664. };
         assert!(
@@ -3623,6 +5549,193 @@ mod tests {
         assert!(transcript.size.height > px(0.));
         let message = bounds(cx, opened.window, "hearing-message");
         assert!(message.bottom() <= transcript.top());
+        if !narrow {
+            assert_eq!(
+                bounds(cx, opened.window, "suggestions-panel").size.width,
+                px(360.)
+            );
+            // The title, the counts, the state, and the filter do not scroll; the cards do.
+            let filter = bounds(cx, opened.window, "suggestion-filter-box");
+            assert!(bounds(cx, opened.window, "suggestion-list-box").top() >= filter.bottom());
+            return;
+        }
+
+        // A narrow window: the suggestions are a button, and a drawer over the transcript.
+        assert!(!shown(cx, opened.window, "suggestions-panel"));
+        assert_apart(
+            cx,
+            opened.window,
+            &["hearings-drawer", "suggestions-trigger", "delete-hearing"],
+        );
+        click(cx, opened.window, "suggestions-drawer");
+        cx.run_until_parked();
+        let sheet = bounds(cx, opened.window, "suggestions-sheet");
+        assert_eq!(sheet.size.width, px(360.));
+        assert!(
+            sheet.top() >= strip.bottom(),
+            "the drawer covers the live strip"
+        );
+        assert_eq!(bounds(cx, opened.window, "transcript-frame"), transcript);
+        cx.update_window(opened.window, |_, window, cx| {
+            assert!(opened.view.read(cx).drawer_focus.is_focused(window));
+        })
+        .unwrap();
+
+        cx.simulate_keystrokes(opened.window, "escape");
+        cx.run_until_parked();
+
+        assert!(!shown(cx, opened.window, "suggestions-sheet"));
+        cx.update_window(opened.window, |_, window, cx| {
+            assert!(opened.view.read(cx).trigger_focus.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    /// A hearing with one statement and a suggestion from an evidence file with a long name.
+    fn hearing_with_long_source(store: &Store, case: i64, name: &str) -> (i64, i64, i64) {
+        let path = temp_dir(&format!("long-{name}"))
+            .join("NTC-ISO-IEC-27002-2022 ANEXO TECNICO CONTROLES DE SEGURIDAD.txt");
+        fs::write(&path, "x").unwrap();
+        let evidence = store.import(case, &path, |_, _| {}).unwrap().id;
+        let long = format!(
+            "{HOTEL} {}",
+            "El texto sigue con más detalles del registro.".repeat(10)
+        );
+        store
+            .save_analysis(
+                evidence,
+                &[Page {
+                    number: 12,
+                    text: long.clone(),
+                    source: PageSource::Text,
+                }],
+            )
+            .unwrap();
+        let chunk = store.search(case, "registro", 1).unwrap()[0].chunk_id;
+        let (hearing, segment) = add_hearing(store, case);
+        let mut new = new_suggestion(hearing, segment, chunk, SuggestionLevel::Conflict);
+        new.evidence_quote = long;
+        let id = store.insert_suggestion(&new).unwrap().id;
+        (hearing, segment, id)
+    }
+
+    async fn check_source_row(name: &str, width: f32, cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, _, id) = hearing_with_long_source(&store, case, name);
+        let dirs = model_dirs(name, true);
+        let opened = open_sized(
+            name,
+            store,
+            case,
+            &FakeBackend::new(""),
+            &dirs,
+            size(px(width), px(700.)),
+            cx,
+        );
+        let narrow = width < 1000.;
+        cx.wait_for(opened.window, WAIT, |_, cx| opened.view.read(cx).loaded)
+            .await;
+        cx.update_window(opened.window, |_, window, cx| {
+            opened
+                .view
+                .update(cx, |view, cx| view.select(hearing, window, cx))
+        })
+        .unwrap();
+        cx.wait_for(opened.window, WAIT, |_, cx| {
+            opened.view.read(cx).suggestions.len() == 1
+        })
+        .await;
+        if narrow {
+            click(cx, opened.window, "suggestions-drawer");
+        }
+        let id = id as u64;
+        cx.wait_for(opened.window, WAIT, |window, _| {
+            window.try_find(("source-locator", id)).is_some()
+        })
+        .await;
+
+        let card = bounds(cx, opened.window, ("suggestion", id));
+        let file = bounds(cx, opened.window, ("source-name", id));
+        let locator = bounds(cx, opened.window, ("source-locator", id));
+        let open = bounds(cx, opened.window, ("source", id));
+        assert!(locator.right() <= card.right() && locator.left() >= card.left());
+        assert!(open.right() <= card.right());
+        assert!(file.right() <= card.right());
+        assert!(!locator.intersects(&file));
+        if narrow {
+            assert!(
+                locator.top() >= file.bottom(),
+                "the locator has its own line"
+            );
+        }
+        // The locator text is whole: "Sección 12" for a text file.
+        assert!(locator.size.width >= px(40.));
+
+        // The long passage shows its start, and the full passage on request.
+        let short = bounds(cx, opened.window, ("quote", id));
+        click(cx, opened.window, ("full-quote", id));
+        cx.run_until_parked();
+        assert!(!shown(cx, opened.window, ("full-quote", id)));
+        assert!(bounds(cx, opened.window, ("quote", id)).size.height > short.size.height);
+    }
+
+    #[gpui_kit::test]
+    async fn the_source_locator_stays_visible_with_a_long_file_name(cx: &mut TestAppContext) {
+        check_source_row("source-wide", 1280., cx).await;
+    }
+
+    #[gpui_kit::test]
+    async fn the_source_locator_has_its_own_line_in_a_narrow_window(cx: &mut TestAppContext) {
+        check_source_row("source-narrow", 900., cx).await;
+    }
+
+    #[test]
+    fn a_long_quote_is_cut_after_a_word() {
+        let (short, cut) = super::short_quote(&"palabra ".repeat(60));
+        assert!(cut);
+        assert!(short.ends_with("palabra…"), "{short}");
+        assert!(short.chars().count() <= super::SHORT_QUOTE + 1);
+        assert_eq!(super::short_quote(HOTEL), (HOTEL.to_owned(), false));
+    }
+
+    #[gpui_kit::test]
+    async fn ver_declaracion_scrolls_to_the_statement_of_the_claim(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "statement");
+        let (hearing, first) = add_hearing(&store, case);
+        for n in 1..=60 {
+            let id = store
+                .insert_segment(hearing, 10_000 + n * 1_000, Speaker::Other)
+                .unwrap();
+            store
+                .finish_segment(id, &format!("Pregunta número {n}."), 10_500 + n * 1_000)
+                .unwrap();
+        }
+        let id = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                first,
+                chunk,
+                SuggestionLevel::Check,
+            ))
+            .unwrap()
+            .id as u64;
+        let dirs = model_dirs("statement", true);
+        let (window, view) = open_pair("statement", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).segments.len() == 61)
+            .await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("show-statement", id)).is_some()
+        })
+        .await;
+        let frame = bounds(cx, window, "transcript-frame");
+        assert!(!bounds(cx, window, ("segment", first as u64)).intersects(&frame));
+
+        click(cx, window, ("show-statement", id));
+        cx.run_until_parked();
+
+        assert!(bounds(cx, window, ("segment", first as u64)).intersects(&frame));
     }
 
     #[gpui_kit::test]

@@ -5,6 +5,7 @@ mod extract;
 mod hearings;
 mod models;
 mod preview;
+mod review;
 mod store;
 mod transfer;
 
@@ -17,6 +18,7 @@ use crate::app::FilesView;
 use crate::audio::native::NativeBackend;
 use crate::hearings::HearingsEnv;
 use crate::models::ModelDirs;
+use crate::review::native::NativeReview;
 use crate::store::Store;
 
 actions!(nicolaw, [Quit]);
@@ -40,6 +42,7 @@ fn main() {
     app::remove_open_copies(&app::open_copies_dir()).ok();
     let hearings_env = HearingsEnv {
         backend: Arc::new(NativeBackend),
+        review: Arc::new(NativeReview),
         model_dirs: ModelDirs::system(),
         data_dir: data_dir.clone(),
     };

@@ -11,14 +11,20 @@ use crate::extract::{Page, PageSource};
 /// The largest file that the store accepts: 100 MB.
 pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
+/// The analysis search takes at most this number of passages from one evidence file before it
+/// fills the rest of its limit by rank.
+pub const PASSAGES_PER_EVIDENCE: usize = 2;
+
 /// The store moves file content in blocks of this size, and reports progress after each block.
 pub const BLOCK_SIZE: usize = 256 * 1024;
 
 /// Version 1 had one `files` table. Version 2 has cases, evidence, pages, chunks, and search.
-/// Version 3 adds hearings and their transcript segments. No release has version 3 yet, so its
-/// segment columns can still grow: [`Store::migrate`] adds the new columns to a version 3
-/// database that a development build made.
-const SCHEMA_VERSION: i64 = 3;
+/// Version 3 adds hearings and their transcript segments. Version 4 adds the suggestions of
+/// the analysis. No release has version 3 yet, so its segment columns can still grow:
+/// [`Store::migrate`] adds the new columns to a database that a development build made.
+const SCHEMA_VERSION: i64 = 4;
+/// A question is the context of a statement only when it ends at most this long before it.
+pub const QUESTION_MAX_GAP_MS: i64 = 90_000;
 
 const SCHEMA_V2: &str = "
     DROP TABLE IF EXISTS files;
@@ -101,6 +107,41 @@ const SCHEMA_V3: &str = "
         failed     INTEGER NOT NULL DEFAULT 0  -- 1: the speech in this time range has no text
     );
     CREATE INDEX segments_hearing ON segments(hearing_id);
+";
+
+const SCHEMA_V4: &str = "
+    CREATE TABLE suggestions (
+        id                INTEGER PRIMARY KEY,
+        hearing_id        INTEGER NOT NULL REFERENCES hearings(id),
+        segment_id        INTEGER NOT NULL REFERENCES segments(id),
+        chunk_id          INTEGER NOT NULL REFERENCES chunks(id),
+        claim             TEXT    NOT NULL,
+        evidence_quote    TEXT    NOT NULL,
+        claim_quote       TEXT,
+        kind              TEXT
+            CHECK (kind IN ('date', 'amount', 'identity', 'location', 'sequence', 'other')),
+        level             TEXT    NOT NULL CHECK (level IN ('conflict', 'check')),
+        nli_contradiction REAL    NOT NULL,
+        explanation       TEXT,
+        status            TEXT    NOT NULL DEFAULT 'open'
+            CHECK (status IN ('open', 'confirmed', 'dismissed', 'stale')),
+        created_at        INTEGER NOT NULL, -- Unix seconds
+        segment_revision  INTEGER NOT NULL DEFAULT 0 -- The revision of the analyzed text
+    );
+    CREATE INDEX suggestions_hearing ON suggestions(hearing_id);
+    CREATE INDEX suggestions_chunk ON suggestions(chunk_id);
+    CREATE INDEX suggestions_segment ON suggestions(segment_id);
+";
+
+/// The analysis state of the text of each segment of the accused. A state of an earlier
+/// revision does not apply to the current text.
+const ANALYSIS_STATES: &str = "
+    CREATE TABLE IF NOT EXISTS segment_analysis (
+        segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
+        revision   INTEGER NOT NULL,
+        state      TEXT    NOT NULL CHECK (state IN
+            ('waiting', 'complete', 'no_claim', 'no_source', 'failed', 'skipped'))
+    );
 ";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +230,202 @@ pub struct Segment {
     pub failed: bool,
 }
 
+/// How sure the analysis is that a statement conflicts with the evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionLevel {
+    /// The NLI model and the language model agree that the passage contradicts the statement.
+    Conflict,
+    /// The passage can contradict the statement. A person must read it.
+    Check,
+}
+
+impl SuggestionLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::Check => "check",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "conflict" => Self::Conflict,
+            _ => Self::Check,
+        }
+    }
+}
+
+/// What the statement and the evidence do not agree on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Date,
+    Amount,
+    Identity,
+    Location,
+    Sequence,
+    Other,
+}
+
+impl SuggestionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Date => "date",
+            Self::Amount => "amount",
+            Self::Identity => "identity",
+            Self::Location => "location",
+            Self::Sequence => "sequence",
+            Self::Other => "other",
+        }
+    }
+
+    /// Returns `None` for a value that is not a kind.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "date" => Self::Date,
+            "amount" => Self::Amount,
+            "identity" => Self::Identity,
+            "location" => Self::Location,
+            "sequence" => Self::Sequence,
+            "other" => Self::Other,
+            _ => return None,
+        })
+    }
+}
+
+/// The decision of the lawyer about a suggestion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionStatus {
+    Open,
+    Confirmed,
+    Dismissed,
+    /// The text or the speaker of the segment changed after the analysis, before a decision.
+    Stale,
+}
+
+impl SuggestionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Confirmed => "confirmed",
+            Self::Dismissed => "dismissed",
+            Self::Stale => "stale",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "confirmed" => Self::Confirmed,
+            "dismissed" => Self::Dismissed,
+            "stale" => Self::Stale,
+            _ => Self::Open,
+        }
+    }
+}
+
+/// The result of the analysis of the current text of a segment of the accused. No state
+/// means that the text agrees with the evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AnalysisState {
+    /// The segment is in the analysis queue.
+    Waiting,
+    /// The analysis compared the claims with passages of the evidence.
+    Complete,
+    /// The statement has no claim that evidence can confirm or contradict.
+    NoClaim,
+    /// The search found no passage for the claims.
+    NoSource,
+    /// A model or the storage failed.
+    Failed,
+    /// The statement was not analyzed: the analysis was off, it stopped, or the queue was full.
+    Skipped,
+}
+
+impl AnalysisState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Complete => "complete",
+            Self::NoClaim => "no_claim",
+            Self::NoSource => "no_source",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "waiting" => Self::Waiting,
+            "complete" => Self::Complete,
+            "no_claim" => Self::NoClaim,
+            "no_source" => Self::NoSource,
+            "failed" => Self::Failed,
+            "skipped" => Self::Skipped,
+            _ => return None,
+        })
+    }
+}
+
+/// A suggestion before it is stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewSuggestion {
+    pub hearing_id: i64,
+    pub segment_id: i64,
+    pub chunk_id: i64,
+    /// One statement of the accused, as a standalone sentence.
+    pub claim: String,
+    /// The part of the claim that conflicts, if the language model found it.
+    pub claim_quote: Option<String>,
+    /// The exact passage of the evidence.
+    pub evidence_quote: String,
+    pub kind: Option<SuggestionKind>,
+    pub level: SuggestionLevel,
+    /// The probability of contradiction from the NLI model, from 0 to 1.
+    pub nli_contradiction: f64,
+    pub explanation: Option<String>,
+    /// The revision of the segment text that the analysis read.
+    pub segment_revision: i64,
+}
+
+/// A stored suggestion, with the source of its evidence passage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suggestion {
+    pub id: i64,
+    pub hearing_id: i64,
+    pub segment_id: i64,
+    pub chunk_id: i64,
+    pub evidence_id: i64,
+    pub evidence_name: String,
+    /// The type of the evidence file, for its locator label (page or section).
+    pub evidence_mime: String,
+    pub page: u32,
+    pub claim: String,
+    pub claim_quote: Option<String>,
+    pub evidence_quote: String,
+    pub kind: Option<SuggestionKind>,
+    pub level: SuggestionLevel,
+    pub nli_contradiction: f64,
+    pub explanation: Option<String>,
+    pub status: SuggestionStatus,
+    pub segment_revision: i64,
+}
+
+/// The open suggestions of a hearing, by level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SuggestionCounts {
+    pub conflict: u32,
+    pub check: u32,
+}
+
+/// One chunk of evidence text, with its file and page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkSource {
+    pub id: i64,
+    pub evidence_id: i64,
+    pub evidence_name: String,
+    pub page: u32,
+    pub text: String,
+}
+
 /// One evidence file, without its content.
 #[derive(Clone, Debug)]
 pub struct Evidence {
@@ -222,7 +459,7 @@ pub struct SearchHit {
     pub chunk_id: i64,
     pub snippet: String,
     /// BM25 rank. A lower value is a better match.
-    // The list shows hits in rank order. The rank value is for the retrieval in layer 3.
+    // The list and the analysis use the hits in rank order. The value is for diagnostics.
     #[allow(dead_code)]
     pub rank: f64,
 }
@@ -264,6 +501,14 @@ const SELECT_EVIDENCE: &str = "SELECT e.id, e.name, e.mime, e.size, e.sha256, \
      (SELECT count(*) FROM evidence_pages p WHERE p.evidence_id = e.id) \
      FROM evidence e";
 
+const SELECT_SUGGESTION: &str = "SELECT s.id, s.hearing_id, s.segment_id, s.chunk_id, \
+     c.evidence_id, e.name, c.page, s.claim, s.claim_quote, s.evidence_quote, s.kind, s.level, \
+     s.nli_contradiction, s.explanation, s.status, s.segment_revision, e.mime \
+     FROM suggestions s JOIN chunks c ON c.id = s.chunk_id JOIN evidence e ON e.id = c.evidence_id";
+
+const SELECT_SEGMENT: &str =
+    "SELECT id, t_start_ms, t_end_ms, text, speaker, final, revision, failed FROM segments";
+
 const SELECT_HEARING: &str = "SELECT id, title, \
      strftime('%Y-%m-%d %H:%M', started_at, 'unixepoch', 'localtime'), \
      strftime('%Y-%m-%d %H:%M', ended_at, 'unixepoch', 'localtime'), \
@@ -294,11 +539,15 @@ impl Store {
                 // No data of version 1 is in use, so the migration drops the `files` table.
                 tx.execute_batch(SCHEMA_V2)?;
             }
-            tx.execute_batch(SCHEMA_V3)?;
+            if version < 3 {
+                tx.execute_batch(SCHEMA_V3)?;
+            }
+            tx.execute_batch(SCHEMA_V4)?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
         }
         add_segment_columns(&conn)?;
+        update_suggestions(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -536,7 +785,8 @@ impl Store {
         query: &str,
         hits_per_group: usize,
     ) -> rusqlite::Result<Vec<SearchGroup>> {
-        let Some(query) = fts_query(query) else {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let Some(query) = fts_query(&words, " ") else {
             return Ok(Vec::new());
         };
         let mut groups: Vec<SearchGroup> = Vec::new();
@@ -595,30 +845,75 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<SearchHit>> {
-        let Some(query) = fts_query(query) else {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        self.run_search(case_id, fts_query(&words, " "), limit, limit)
+    }
+
+    /// Full-text search for chunks that have at least one of the words, best match first. The
+    /// BM25 rank puts chunks with more of the words, and with rare words, first. Each word is a
+    /// prefix term, and a word with spaces or punctuation (for example a date) is a phrase.
+    /// The first hits take at most [`PASSAGES_PER_EVIDENCE`] chunks from one file; the rest of
+    /// the limit fills by rank. Thus one file with many hits cannot fill all the candidates.
+    pub fn search_any(
+        &self,
+        case_id: i64,
+        words: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<SearchHit>> {
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        self.run_search(
+            case_id,
+            fts_query(&words, " OR "),
+            limit,
+            PASSAGES_PER_EVIDENCE,
+        )
+    }
+
+    /// The best `limit` hits. The hits with a rank of at most `per_evidence` in their file come
+    /// first, by rank; the other hits fill the rest of the limit, by rank.
+    fn run_search(
+        &self,
+        case_id: i64,
+        query: Option<String>,
+        limit: usize,
+        per_evidence: usize,
+    ) -> rusqlite::Result<Vec<SearchHit>> {
+        let Some(query) = query else {
             return Ok(Vec::new());
         };
         self.conn
             .prepare(
-                "SELECT e.id, e.name, c.page, c.id,
-                        snippet(chunks_fts, 0, '', '', '…', 16), bm25(chunks_fts)
-                 FROM chunks_fts
-                 JOIN chunks c ON c.id = chunks_fts.rowid
-                 JOIN evidence e ON e.id = c.evidence_id
-                 WHERE chunks_fts MATCH ?1 AND e.case_id = ?2
-                 ORDER BY bm25(chunks_fts)
+                "WITH hits AS (
+                     SELECT e.id AS evidence_id, e.name AS name, c.page AS page,
+                            c.id AS chunk_id, snippet(chunks_fts, 0, '', '', '…', 16) AS snippet,
+                            bm25(chunks_fts) AS rank
+                     FROM chunks_fts
+                     JOIN chunks c ON c.id = chunks_fts.rowid
+                     JOIN evidence e ON e.id = c.evidence_id
+                     WHERE chunks_fts MATCH ?1 AND e.case_id = ?2
+                 ), numbered AS (
+                     SELECT *,
+                            row_number() OVER (PARTITION BY evidence_id ORDER BY rank, chunk_id)
+                                AS n
+                     FROM hits
+                 )
+                 SELECT evidence_id, name, page, chunk_id, snippet, rank FROM numbered
+                 ORDER BY n > ?4, rank, chunk_id
                  LIMIT ?3",
             )?
-            .query_map(params![query, case_id, limit as i64], |row| {
-                Ok(SearchHit {
-                    evidence_id: row.get(0)?,
-                    evidence_name: row.get(1)?,
-                    page: row.get(2)?,
-                    chunk_id: row.get(3)?,
-                    snippet: row.get(4)?,
-                    rank: row.get(5)?,
-                })
-            })?
+            .query_map(
+                params![query, case_id, limit as i64, per_evidence as i64],
+                |row| {
+                    Ok(SearchHit {
+                        evidence_id: row.get(0)?,
+                        evidence_name: row.get(1)?,
+                        page: row.get(2)?,
+                        chunk_id: row.get(3)?,
+                        snippet: row.get(4)?,
+                        rank: row.get(5)?,
+                    })
+                },
+            )?
             .collect()
     }
 
@@ -694,10 +989,11 @@ impl Store {
         )
     }
 
-    /// Deletes the hearing with its segments, then its audio file.
+    /// Deletes the hearing with its segments and suggestions, then its audio file.
     pub fn delete_hearing(&self, id: i64) -> rusqlite::Result<()> {
         let audio_path = self.hearing(id)?.audio_path;
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM suggestions WHERE hearing_id = ?1", [id])?;
         tx.execute("DELETE FROM segments WHERE hearing_id = ?1", [id])?;
         tx.execute("DELETE FROM hearings WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -735,13 +1031,21 @@ impl Store {
     /// Replaces the text of a segment, for example with a more accurate transcription. The
     /// first text stays as the live text, and the revision grows by 1. The same text again
     /// changes nothing.
+    ///
+    /// The open suggestions of the earlier text become stale: a person must review them again.
     pub fn set_segment_text(&self, id: i64, text: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE segments SET live_text = coalesce(live_text, text), text = ?1,
              revision = revision + 1 WHERE id = ?2 AND text <> ?1",
             params![text, id],
         )?;
-        Ok(())
+        tx.execute(
+            "UPDATE suggestions SET status = 'stale' WHERE segment_id = ?1 AND status = 'open'
+               AND segment_revision < (SELECT revision FROM segments WHERE id = ?1)",
+            [id],
+        )?;
+        tx.commit()
     }
 
     /// The text of the live transcription, if a later text replaced it.
@@ -780,23 +1084,220 @@ impl Store {
     /// Returns the segments of a hearing in time order.
     pub fn segments(&self, hearing_id: i64) -> rusqlite::Result<Vec<Segment>> {
         self.conn
+            .prepare(&format!(
+                "{SELECT_SEGMENT} WHERE hearing_id = ?1 ORDER BY t_start_ms, id"
+            ))?
+            .query_map([hearing_id], row_to_segment)?
+            .collect()
+    }
+
+    pub fn segment(&self, id: i64) -> rusqlite::Result<Segment> {
+        self.conn.query_row(
+            &format!("{SELECT_SEGMENT} WHERE id = ?1"),
+            [id],
+            row_to_segment,
+        )
+    }
+
+    /// The text of the last final segment of an other speaker before `t_start_ms`: usually the
+    /// question that the accused answers. The question must end at most
+    /// [`QUESTION_MAX_GAP_MS`] before the statement, and no final segment of the accused can be
+    /// between them. Else the statement has no question, so that an old question does not
+    /// change the meaning of a new statement.
+    pub fn question_before(
+        &self,
+        hearing_id: i64,
+        t_start_ms: i64,
+    ) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT text FROM segments q
+                 WHERE q.hearing_id = ?1 AND q.t_start_ms < ?2 AND q.speaker = 'other'
+                   AND q.final = 1 AND q.failed = 0 AND q.t_end_ms >= ?2 - ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM segments a
+                       WHERE a.hearing_id = ?1 AND a.speaker = 'accused' AND a.final = 1
+                         AND a.t_start_ms > q.t_start_ms AND a.t_start_ms < ?2)
+                 ORDER BY q.t_start_ms DESC, q.id DESC LIMIT 1",
+                params![hearing_id, t_start_ms, QUESTION_MAX_GAP_MS],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// One chunk of evidence text, with its file and page.
+    pub fn chunk(&self, id: i64) -> rusqlite::Result<ChunkSource> {
+        self.conn.query_row(
+            "SELECT c.id, c.evidence_id, e.name, c.page, c.text
+             FROM chunks c JOIN evidence e ON e.id = c.evidence_id WHERE c.id = ?1",
+            [id],
+            |row| {
+                Ok(ChunkSource {
+                    id: row.get(0)?,
+                    evidence_id: row.get(1)?,
+                    evidence_name: row.get(2)?,
+                    page: row.get(3)?,
+                    text: row.get(4)?,
+                })
+            },
+        )
+    }
+
+    /// Stores a new open suggestion. Returns it with the source of its evidence passage.
+    pub fn insert_suggestion(&self, new: &NewSuggestion) -> rusqlite::Result<Suggestion> {
+        self.conn.execute(
+            "INSERT INTO suggestions (hearing_id, segment_id, chunk_id, claim, evidence_quote,
+                 claim_quote, kind, level, nli_contradiction, explanation, created_at,
+                 segment_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch(), ?11)",
+            params![
+                new.hearing_id,
+                new.segment_id,
+                new.chunk_id,
+                new.claim,
+                new.evidence_quote,
+                new.claim_quote,
+                new.kind.map(SuggestionKind::as_str),
+                new.level.as_str(),
+                new.nli_contradiction,
+                new.explanation,
+                new.segment_revision,
+            ],
+        )?;
+        self.conn.query_row(
+            &format!("{SELECT_SUGGESTION} WHERE s.id = ?1"),
+            [self.conn.last_insert_rowid()],
+            row_to_suggestion,
+        )
+    }
+
+    /// The suggestions of a hearing: open first, then newest first.
+    pub fn suggestions(&self, hearing_id: i64) -> rusqlite::Result<Vec<Suggestion>> {
+        self.conn
+            .prepare(&format!(
+                "{SELECT_SUGGESTION} WHERE s.hearing_id = ?1
+                 ORDER BY s.status = 'open' DESC, s.created_at DESC, s.id DESC"
+            ))?
+            .query_map([hearing_id], row_to_suggestion)?
+            .collect()
+    }
+
+    /// Stores the result of the analysis of revision `revision` of a segment, in one
+    /// transaction: the new suggestions and the analysis state. Returns `None`, and changes
+    /// nothing, when the segment is gone, its text has an other revision, or it is not a final
+    /// segment of the accused. Earlier suggestions stay: decisions are history, and open
+    /// suggestions of earlier text are stale. A new suggestion for a passage that already has
+    /// a suggestion of this revision (open, confirmed, or dismissed) is not stored again.
+    pub fn replace_suggestions(
+        &self,
+        segment_id: i64,
+        revision: i64,
+        new: &[NewSuggestion],
+        state: AnalysisState,
+    ) -> rusqlite::Result<Option<Vec<Suggestion>>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let current: bool = tx
+            .query_row(
+                "SELECT revision = ?2 AND speaker = 'accused' AND final = 1 FROM segments
+                 WHERE id = ?1",
+                params![segment_id, revision],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !current {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE suggestions SET status = 'stale'
+             WHERE segment_id = ?1 AND status = 'open' AND segment_revision <> ?2",
+            params![segment_id, revision],
+        )?;
+        let mut stored = Vec::new();
+        for suggestion in new {
+            let known = tx
+                .prepare(
+                    "SELECT 1 FROM suggestions WHERE segment_id = ?1 AND segment_revision = ?2
+                       AND chunk_id = ?3 AND status <> 'stale'",
+                )?
+                .exists(params![segment_id, revision, suggestion.chunk_id])?;
+            if !known {
+                stored.push(self.insert_suggestion(&NewSuggestion {
+                    segment_revision: revision,
+                    ..suggestion.clone()
+                })?);
+            }
+        }
+        self.set_analysis_state(segment_id, Some(revision), state)?;
+        tx.commit()?;
+        Ok(Some(stored))
+    }
+
+    /// Marks the open suggestions of a segment stale, for example after a speaker correction.
+    /// Returns their number.
+    pub fn mark_stale(&self, segment_id: i64) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE suggestions SET status = 'stale' WHERE segment_id = ?1 AND status = 'open'",
+            [segment_id],
+        )
+    }
+
+    /// Sets the analysis state of the current text of a segment. With `revision`, only when
+    /// the text has this revision. Returns false when nothing changed.
+    pub fn set_analysis_state(
+        &self,
+        segment_id: i64,
+        revision: Option<i64>,
+        state: AnalysisState,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT INTO segment_analysis (segment_id, revision, state)
+             SELECT id, revision, ?2 FROM segments WHERE id = ?1 AND (?3 IS NULL OR revision = ?3)
+             ON CONFLICT (segment_id) DO UPDATE SET revision = excluded.revision,
+                 state = excluded.state",
+            params![segment_id, state.as_str(), revision],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The analysis states of the current texts of the accused in a hearing, in time order.
+    pub fn analysis_states(&self, hearing_id: i64) -> rusqlite::Result<Vec<(i64, AnalysisState)>> {
+        self.conn
             .prepare(
-                "SELECT id, t_start_ms, t_end_ms, text, speaker, final, revision, failed
-                 FROM segments WHERE hearing_id = ?1 ORDER BY t_start_ms, id",
+                "SELECT s.id, a.state FROM segment_analysis a JOIN segments s ON s.id = a.segment_id
+                 WHERE s.hearing_id = ?1 AND s.speaker = 'accused' AND a.revision = s.revision
+                 ORDER BY s.t_start_ms, s.id",
             )?
             .query_map([hearing_id], |row| {
-                Ok(Segment {
-                    id: row.get(0)?,
-                    t_start_ms: row.get(1)?,
-                    t_end_ms: row.get(2)?,
-                    text: row.get(3)?,
-                    speaker: Speaker::parse(&row.get::<_, String>(4)?),
-                    is_final: row.get(5)?,
-                    revision: row.get(6)?,
-                    failed: row.get(7)?,
-                })
+                Ok((row.get(0)?, row.get::<_, String>(1)?))
             })?
+            .map(|row| {
+                row.map(|(id, state)| (id, AnalysisState::parse(&state).unwrap_or(AnalysisState::Failed)))
+            })
             .collect()
+    }
+
+    pub fn set_suggestion_status(&self, id: i64, status: SuggestionStatus) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE suggestions SET status = ?1 WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn suggestion_counts(&self, hearing_id: i64) -> rusqlite::Result<SuggestionCounts> {
+        self.conn.query_row(
+            "SELECT count(*) FILTER (WHERE level = 'conflict'),
+                    count(*) FILTER (WHERE level = 'check')
+             FROM suggestions WHERE hearing_id = ?1 AND status = 'open'",
+            [hearing_id],
+            |row| {
+                Ok(SuggestionCounts {
+                    conflict: row.get(0)?,
+                    check: row.get(1)?,
+                })
+            },
+        )
     }
 }
 
@@ -824,23 +1325,72 @@ fn add_segment_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Gives a `suggestions` table of an earlier development build the `stale` status and the
+/// `segment_revision` column, and adds the `segment_analysis` table. The rows stay. A database
+/// without the `suggestions` table is not changed.
+fn update_suggestions(conn: &mut Connection) -> rusqlite::Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'suggestions'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    let tx = conn.transaction()?;
+    if !sql.contains("'stale'") {
+        // SQLite cannot change a CHECK constraint: copy the rows into a new table with the
+        // same columns (also the columns that later versions added) and the new status.
+        let new_sql = sql.replace("'dismissed')", "'dismissed', 'stale')");
+        if new_sql == sql {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        tx.execute_batch(&format!(
+            "ALTER TABLE suggestions RENAME TO suggestions_old;
+             {new_sql};
+             INSERT INTO suggestions SELECT * FROM suggestions_old;
+             DROP TABLE suggestions_old;
+             CREATE INDEX suggestions_hearing ON suggestions(hearing_id);
+             CREATE INDEX suggestions_chunk ON suggestions(chunk_id);"
+        ))?;
+    }
+    let has_revision = tx
+        .prepare("SELECT 1 FROM pragma_table_info('suggestions') WHERE name = 'segment_revision'")?
+        .exists([])?;
+    if !has_revision {
+        tx.execute_batch(
+            "ALTER TABLE suggestions ADD COLUMN segment_revision INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS suggestions_segment ON suggestions(segment_id);")?;
+    tx.execute_batch(ANALYSIS_STATES)?;
+    tx.commit()
+}
+
 fn delete_analysis(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    // A suggestion without its evidence passage has no source, so it goes with the chunks.
+    conn.execute(
+        "DELETE FROM suggestions WHERE chunk_id IN (SELECT id FROM chunks WHERE evidence_id = ?1)",
+        [id],
+    )?;
     conn.execute("DELETE FROM chunks WHERE evidence_id = ?1", [id])?;
     conn.execute("DELETE FROM evidence_pages WHERE evidence_id = ?1", [id])?;
     Ok(())
 }
 
-/// Converts user input to an FTS5 query: each word becomes a quoted prefix term, so that
-/// quotes and operators in the input have no special meaning. Returns `None` if no word
-/// has a letter or a digit.
-fn fts_query(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
+/// Converts words to an FTS5 query: each word becomes a quoted prefix term, so that quotes and
+/// operators in the input have no special meaning. The terms are joined with `joiner`: a
+/// space (all terms must match) or `" OR "`. Returns `None` if no word has a letter or a digit.
+fn fts_query(words: &[&str], joiner: &str) -> Option<String> {
+    let terms: Vec<String> = words
+        .iter()
         .map(|word| word.replace('"', ""))
         .filter(|word| word.chars().any(char::is_alphanumeric))
         .map(|word| format!("\"{word}\"*"))
         .collect();
-    (!terms.is_empty()).then(|| terms.join(" "))
+    (!terms.is_empty()).then(|| terms.join(joiner))
 }
 
 /// True if the stored pages of a file of this type are physical pages: a PDF or an image. A DOCX
@@ -863,6 +1413,44 @@ pub fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn row_to_segment(row: &rusqlite::Row) -> rusqlite::Result<Segment> {
+    Ok(Segment {
+        id: row.get(0)?,
+        t_start_ms: row.get(1)?,
+        t_end_ms: row.get(2)?,
+        text: row.get(3)?,
+        speaker: Speaker::parse(&row.get::<_, String>(4)?),
+        is_final: row.get(5)?,
+        revision: row.get(6)?,
+        failed: row.get(7)?,
+    })
+}
+
+fn row_to_suggestion(row: &rusqlite::Row) -> rusqlite::Result<Suggestion> {
+    Ok(Suggestion {
+        id: row.get(0)?,
+        hearing_id: row.get(1)?,
+        segment_id: row.get(2)?,
+        chunk_id: row.get(3)?,
+        evidence_id: row.get(4)?,
+        evidence_name: row.get(5)?,
+        page: row.get(6)?,
+        claim: row.get(7)?,
+        claim_quote: row.get(8)?,
+        evidence_quote: row.get(9)?,
+        kind: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .and_then(SuggestionKind::parse),
+        level: SuggestionLevel::parse(&row.get::<_, String>(11)?),
+        nli_contradiction: row.get(12)?,
+        explanation: row.get(13)?,
+        status: SuggestionStatus::parse(&row.get::<_, String>(14)?),
+        segment_revision: row.get(15)?,
+        evidence_mime: row.get(16)?,
+    })
 }
 
 fn row_to_hearing(row: &rusqlite::Row) -> rusqlite::Result<Hearing> {
@@ -898,8 +1486,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, SCHEMA_V2, Speaker, Store,
-        locator_label,
+        AnalysisState, AnalysisStatus, BLOCK_SIZE, ImportError, MAX_FILE_SIZE, NewSuggestion,
+        SCHEMA_V2, Speaker, Store, SuggestionCounts, SuggestionKind, SuggestionLevel,
+        SuggestionStatus, locator_label,
     };
     use crate::extract::{Page, PageSource};
 
@@ -1215,6 +1804,27 @@ mod tests {
     }
 
     #[test]
+    fn search_any_takes_two_passages_from_one_file_before_it_fills_by_rank() {
+        let (store, case) = store_with_case();
+        let large = import(&store, case, &temp_file("grande.txt", b"x"));
+        store
+            .save_analysis(large, &[text_page(1, &"El testigo habló. ".repeat(20_000))])
+            .unwrap();
+        let small = import(&store, case, &temp_file("acta.txt", b"x"));
+        store
+            .save_analysis(small, &[text_page(1, &long_page_with("testigo"))])
+            .unwrap();
+        let words = ["testigo".to_owned()];
+
+        let hits = store.search_any(case, &words, 5).unwrap();
+
+        let ids: Vec<i64> = hits.iter().map(|hit| hit.evidence_id).collect();
+        assert_eq!(ids, [large, large, small, large, large]);
+        assert!(hits[..2].iter().all(|hit| hit.rank <= hits[2].rank));
+        assert!(hits[3..].iter().all(|hit| hit.rank <= hits[2].rank));
+    }
+
+    #[test]
     fn delete_removes_the_evidence_with_its_pages_and_chunks() {
         let (store, case) = store_with_case();
         let id = import(&store, case, &temp_file("gone.txt", b"x"));
@@ -1325,7 +1935,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(old_table, 0);
     }
 
@@ -1421,6 +2031,29 @@ mod tests {
         assert_eq!(store.list(1).unwrap()[0].name, "acta.txt");
         let hearing = store.create_hearing(1, "Audiencia").unwrap();
         assert_eq!(store.hearings(1).unwrap()[0].id, hearing.id);
+    }
+
+    #[test]
+    fn a_version_3_database_keeps_its_hearings_and_gets_suggestions() {
+        let dir = std::env::temp_dir().join(format!("nicolaw-v3-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v3.db");
+        let _ = fs::remove_file(&db);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(super::SCHEMA_V2).unwrap();
+        conn.execute_batch(super::SCHEMA_V3).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 3;
+             INSERT INTO cases VALUES (1, 'Caso', 0);
+             INSERT INTO hearings (id, case_id, title) VALUES (1, 1, 'Audiencia');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        assert_eq!(store.hearings(1).unwrap()[0].title, "Audiencia");
+        assert!(store.suggestions(1).unwrap().is_empty());
     }
 
     #[test]
@@ -1645,5 +2278,547 @@ mod tests {
                 .iter()
                 .all(|part| part.chars().all(|c| c.is_ascii_digit()))
         );
+    }
+
+    /// A store with one case, one analyzed evidence file, and one hearing with one accused
+    /// segment. Returns the store, the hearing id, the segment id, and the chunk id.
+    fn store_with_hearing_and_evidence() -> (Store, i64, i64, i64, i64) {
+        let (store, case) = store_with_case();
+        let evidence = import(&store, case, &temp_file("acta.txt", b"x"));
+        store
+            .save_analysis(
+                evidence,
+                &[text_page(1, "Primera página."), text_page(2, DECLARATION)],
+            )
+            .unwrap();
+        let chunk = store.search(case, "declaracion", 1).unwrap()[0].chunk_id;
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store
+            .insert_segment(hearing, 1_000, Speaker::Accused)
+            .unwrap();
+        store
+            .finish_segment(segment, "Yo estaba en Medellín el 12 de marzo.", 4_000)
+            .unwrap();
+        (store, hearing, segment, chunk, evidence)
+    }
+
+    fn suggestion(
+        hearing_id: i64,
+        segment_id: i64,
+        chunk_id: i64,
+        level: SuggestionLevel,
+    ) -> NewSuggestion {
+        NewSuggestion {
+            hearing_id,
+            segment_id,
+            chunk_id,
+            claim: "El acusado estaba en Medellín el 12 de marzo.".into(),
+            claim_quote: Some("en Medellín".into()),
+            evidence_quote: "rendida el 12 de marzo de 2024 en Bogotá".into(),
+            kind: Some(SuggestionKind::Location),
+            level,
+            nli_contradiction: 0.93,
+            explanation: Some("La prueba ubica la declaración en Bogotá.".into()),
+            segment_revision: 0,
+        }
+    }
+
+    #[test]
+    fn a_text_change_marks_the_open_suggestions_stale_and_keeps_the_decisions() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let add = || {
+            store
+                .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+                .unwrap()
+                .id
+        };
+        let (open, confirmed, dismissed) = (add(), add(), add());
+        store
+            .set_suggestion_status(confirmed, SuggestionStatus::Confirmed)
+            .unwrap();
+        store
+            .set_suggestion_status(dismissed, SuggestionStatus::Dismissed)
+            .unwrap();
+
+        store
+            .set_segment_text(segment, "Yo estaba en Cali el 12 de marzo.")
+            .unwrap();
+
+        let status = |id| {
+            store
+                .suggestions(hearing)
+                .unwrap()
+                .into_iter()
+                .find(|suggestion| suggestion.id == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status(open), SuggestionStatus::Stale);
+        assert_eq!(status(confirmed), SuggestionStatus::Confirmed);
+        assert_eq!(status(dismissed), SuggestionStatus::Dismissed);
+        assert_eq!(
+            store.suggestion_counts(hearing).unwrap(),
+            SuggestionCounts::default()
+        );
+    }
+
+    #[test]
+    fn new_suggestions_replace_nothing_when_the_segment_changed() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let new = [suggestion(
+            hearing,
+            segment,
+            chunk,
+            SuggestionLevel::Conflict,
+        )];
+
+        // The text changed after the analysis read revision 0.
+        store
+            .set_segment_text(segment, "Otra transcripción.")
+            .unwrap();
+        assert_eq!(
+            store
+                .replace_suggestions(segment, 0, &new, AnalysisState::Complete)
+                .unwrap(),
+            None
+        );
+        // The speaker changed.
+        store.set_speaker(segment, Speaker::Other).unwrap();
+        assert_eq!(
+            store
+                .replace_suggestions(segment, 1, &new, AnalysisState::Complete)
+                .unwrap(),
+            None
+        );
+
+        assert!(store.suggestions(hearing).unwrap().is_empty());
+        assert!(store.analysis_states(hearing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_suggestions_are_stored_with_the_revision_and_the_state() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        store
+            .set_segment_text(segment, "Otra transcripción.")
+            .unwrap();
+        let new = [suggestion(
+            hearing,
+            segment,
+            chunk,
+            SuggestionLevel::Conflict,
+        )];
+
+        let stored = store
+            .replace_suggestions(segment, 1, &new, AnalysisState::Complete)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].segment_revision, 1);
+        assert_eq!(stored[0].status, SuggestionStatus::Open);
+        assert_eq!(store.suggestions(hearing).unwrap(), stored);
+        assert_eq!(
+            store.analysis_states(hearing).unwrap(),
+            [(segment, AnalysisState::Complete)]
+        );
+    }
+
+    #[test]
+    fn a_dismissed_suggestion_does_not_come_back_as_an_open_one() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let new = [suggestion(
+            hearing,
+            segment,
+            chunk,
+            SuggestionLevel::Conflict,
+        )];
+        let first = store
+            .replace_suggestions(segment, 0, &new, AnalysisState::Complete)
+            .unwrap()
+            .unwrap();
+        store
+            .set_suggestion_status(first[0].id, SuggestionStatus::Dismissed)
+            .unwrap();
+
+        // The same revision and the same passage, for example after a speaker correction.
+        let again = store
+            .replace_suggestions(segment, 0, &new, AnalysisState::Complete)
+            .unwrap()
+            .unwrap();
+
+        assert!(again.is_empty());
+        let all = store.suggestions(hearing).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, SuggestionStatus::Dismissed);
+    }
+
+    #[test]
+    fn a_speaker_correction_marks_the_open_suggestions_stale() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap();
+
+        assert_eq!(store.mark_stale(segment).unwrap(), 1);
+
+        assert_eq!(
+            store.suggestions(hearing).unwrap()[0].status,
+            SuggestionStatus::Stale
+        );
+    }
+
+    #[test]
+    fn the_analysis_state_belongs_to_the_text_revision() {
+        let (store, hearing, segment, _, _) = store_with_hearing_and_evidence();
+
+        assert!(
+            store
+                .set_analysis_state(segment, None, AnalysisState::Waiting)
+                .unwrap()
+        );
+        assert_eq!(
+            store.analysis_states(hearing).unwrap(),
+            [(segment, AnalysisState::Waiting)]
+        );
+        // A state for an old revision is not stored.
+        store
+            .set_segment_text(segment, "Otra transcripción.")
+            .unwrap();
+        assert!(
+            !store
+                .set_analysis_state(segment, Some(0), AnalysisState::Failed)
+                .unwrap()
+        );
+        // The state of the old text does not apply to the new text.
+        assert!(store.analysis_states(hearing).unwrap().is_empty());
+        store
+            .set_analysis_state(segment, Some(1), AnalysisState::NoSource)
+            .unwrap();
+        assert_eq!(
+            store.analysis_states(hearing).unwrap(),
+            [(segment, AnalysisState::NoSource)]
+        );
+
+        store.delete_hearing(hearing).unwrap();
+        assert!(store.analysis_states(hearing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn analysis_states_have_stable_names() {
+        for state in [
+            AnalysisState::Waiting,
+            AnalysisState::Complete,
+            AnalysisState::NoClaim,
+            AnalysisState::NoSource,
+            AnalysisState::Failed,
+            AnalysisState::Skipped,
+        ] {
+            assert_eq!(AnalysisState::parse(state.as_str()), Some(state));
+        }
+        assert_eq!(AnalysisState::parse("agrees"), None);
+    }
+
+    #[test]
+    fn a_development_version_4_database_gets_the_stale_status_and_the_revision() {
+        let dir = std::env::temp_dir().join(format!("nicolaw-v4-dev-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v4.db");
+        let _ = fs::remove_file(&db);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(super::SCHEMA_V2).unwrap();
+        conn.execute_batch(super::SCHEMA_V3).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE suggestions (
+                 id INTEGER PRIMARY KEY,
+                 hearing_id INTEGER NOT NULL REFERENCES hearings(id),
+                 segment_id INTEGER NOT NULL REFERENCES segments(id),
+                 chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+                 claim TEXT NOT NULL, evidence_quote TEXT NOT NULL, claim_quote TEXT,
+                 kind TEXT, level TEXT NOT NULL CHECK (level IN ('conflict', 'check')),
+                 nli_contradiction REAL NOT NULL, explanation TEXT,
+                 status TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open', 'confirmed', 'dismissed')),
+                 created_at INTEGER NOT NULL);
+             CREATE INDEX suggestions_hearing ON suggestions(hearing_id);
+             CREATE INDEX suggestions_chunk ON suggestions(chunk_id);
+             PRAGMA user_version = 4;
+             INSERT INTO cases VALUES (1, 'Caso', 0);
+             INSERT INTO evidence (id, case_id, name, mime, size, sha256, content, added_at)
+                 VALUES (1, 1, 'acta.txt', 'text/plain', 1, 'x', x'78', 0);
+             INSERT INTO chunks (id, evidence_id, page, idx, text) VALUES (1, 1, 1, 0, 'Texto.');
+             INSERT INTO hearings (id, case_id, title) VALUES (1, 1, 'Audiencia');
+             INSERT INTO segments (id, hearing_id, t_start_ms, t_end_ms, text, speaker, final)
+                 VALUES (1, 1, 0, 900, 'Estaba en Cali.', 'accused', 1);
+             INSERT INTO suggestions (hearing_id, segment_id, chunk_id, claim, evidence_quote,
+                 level, nli_contradiction, status, created_at)
+                 VALUES (1, 1, 1, 'Afirmación.', 'Texto.', 'check', 0.7, 'dismissed', 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        let kept = store.suggestions(1).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].status, SuggestionStatus::Dismissed);
+        assert_eq!(kept[0].segment_revision, 0);
+        store
+            .set_suggestion_status(kept[0].id, SuggestionStatus::Stale)
+            .unwrap();
+        store
+            .set_analysis_state(1, None, AnalysisState::Complete)
+            .unwrap();
+        assert_eq!(
+            store.analysis_states(1).unwrap(),
+            [(1, AnalysisState::Complete)]
+        );
+        drop(store);
+        // A second open changes nothing.
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store.suggestions(1).unwrap()[0].status,
+            SuggestionStatus::Stale
+        );
+    }
+
+    #[test]
+    fn a_suggestion_is_stored_with_its_source_file_and_page() {
+        let (store, hearing, segment, chunk, evidence) = store_with_hearing_and_evidence();
+
+        let stored = store
+            .insert_suggestion(&suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap();
+
+        assert_eq!(stored.hearing_id, hearing);
+        assert_eq!(stored.segment_id, segment);
+        assert_eq!(stored.chunk_id, chunk);
+        assert_eq!(stored.evidence_id, evidence);
+        assert_eq!(stored.evidence_name, "acta.txt");
+        assert_eq!(stored.page, 2);
+        assert_eq!(
+            stored.claim,
+            "El acusado estaba en Medellín el 12 de marzo."
+        );
+        assert_eq!(stored.claim_quote.as_deref(), Some("en Medellín"));
+        assert_eq!(
+            stored.evidence_quote,
+            "rendida el 12 de marzo de 2024 en Bogotá"
+        );
+        assert_eq!(stored.kind, Some(SuggestionKind::Location));
+        assert_eq!(stored.level, SuggestionLevel::Conflict);
+        assert_eq!(stored.nli_contradiction, 0.93);
+        assert_eq!(
+            stored.explanation.as_deref(),
+            Some("La prueba ubica la declaración en Bogotá.")
+        );
+        assert_eq!(stored.status, SuggestionStatus::Open);
+        assert_eq!(store.suggestions(hearing).unwrap()[0].id, stored.id);
+    }
+
+    #[test]
+    fn a_suggestion_can_have_no_quote_kind_or_explanation() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let mut new = suggestion(hearing, segment, chunk, SuggestionLevel::Check);
+        new.claim_quote = None;
+        new.kind = None;
+        new.explanation = None;
+
+        let stored = store.insert_suggestion(&new).unwrap();
+
+        assert_eq!(stored.claim_quote, None);
+        assert_eq!(stored.kind, None);
+        assert_eq!(stored.explanation, None);
+        assert_eq!(stored.level, SuggestionLevel::Check);
+    }
+
+    #[test]
+    fn suggestions_list_open_first_then_newest_first() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let first = store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap()
+            .id;
+        let second = store
+            .insert_suggestion(&suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap()
+            .id;
+        let third = store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap()
+            .id;
+
+        store
+            .set_suggestion_status(third, SuggestionStatus::Dismissed)
+            .unwrap();
+
+        let ids: Vec<i64> = store
+            .suggestions(hearing)
+            .unwrap()
+            .iter()
+            .map(|suggestion| suggestion.id)
+            .collect();
+        assert_eq!(ids, [second, first, third]);
+        assert_eq!(
+            store.suggestions(hearing).unwrap()[2].status,
+            SuggestionStatus::Dismissed
+        );
+    }
+
+    #[test]
+    fn counts_have_the_open_conflicts_and_the_open_checks() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        let add = |level| {
+            store
+                .insert_suggestion(&suggestion(hearing, segment, chunk, level))
+                .unwrap()
+                .id
+        };
+        add(SuggestionLevel::Conflict);
+        let confirmed = add(SuggestionLevel::Conflict);
+        add(SuggestionLevel::Check);
+        add(SuggestionLevel::Check);
+        let dismissed = add(SuggestionLevel::Check);
+        store
+            .set_suggestion_status(confirmed, SuggestionStatus::Confirmed)
+            .unwrap();
+        store
+            .set_suggestion_status(dismissed, SuggestionStatus::Dismissed)
+            .unwrap();
+
+        assert_eq!(
+            store.suggestion_counts(hearing).unwrap(),
+            SuggestionCounts {
+                conflict: 1,
+                check: 2
+            }
+        );
+    }
+
+    #[test]
+    fn delete_hearing_removes_its_suggestions() {
+        let (store, hearing, segment, chunk, _) = store_with_hearing_and_evidence();
+        store
+            .insert_suggestion(&suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap();
+
+        store.delete_hearing(hearing).unwrap();
+
+        assert!(store.suggestions(hearing).unwrap().is_empty());
+        assert_eq!(
+            store.suggestion_counts(hearing).unwrap(),
+            SuggestionCounts::default()
+        );
+    }
+
+    #[test]
+    fn delete_evidence_removes_the_suggestions_of_its_chunks() {
+        let (store, hearing, segment, chunk, evidence) = store_with_hearing_and_evidence();
+        store
+            .insert_suggestion(&suggestion(hearing, segment, chunk, SuggestionLevel::Check))
+            .unwrap();
+
+        store.delete(evidence).unwrap();
+
+        assert!(store.suggestions(hearing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_chunk_gives_its_text_and_its_source() {
+        let (store, _, _, chunk, evidence) = store_with_hearing_and_evidence();
+
+        let source = store.chunk(chunk).unwrap();
+
+        assert_eq!(source.id, chunk);
+        assert_eq!(source.evidence_id, evidence);
+        assert_eq!(source.evidence_name, "acta.txt");
+        assert_eq!(source.page, 2);
+        assert_eq!(source.text, DECLARATION);
+    }
+
+    #[test]
+    fn a_segment_is_read_by_id_with_the_question_before_it() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let add = |t: i64, speaker, text: &str| {
+            let id = store.insert_segment(hearing, t, speaker).unwrap();
+            store.finish_segment(id, text, t + 500).unwrap();
+            id
+        };
+        add(0, Speaker::Other, "¿Dónde estaba usted?");
+        add(1_000, Speaker::Other, "¿Dónde estaba el 12 de marzo?");
+        add(2_000, Speaker::Accused, "No recuerdo.");
+        let answer = add(3_000, Speaker::Accused, "Estaba en Medellín.");
+        let first = store.insert_segment(hearing, 0, Speaker::Accused).unwrap();
+
+        let segment = store.segment(answer).unwrap();
+
+        assert_eq!(segment.text, "Estaba en Medellín.");
+        assert_eq!(segment.speaker, Speaker::Accused);
+        assert_eq!(
+            store.question_before(hearing, 2_000).unwrap().as_deref(),
+            Some("¿Dónde estaba el 12 de marzo?")
+        );
+        // An answer of the accused is between the question and this statement.
+        assert_eq!(store.question_before(hearing, 3_000).unwrap(), None);
+        assert_eq!(store.question_before(hearing, 0).unwrap(), None);
+        assert!(store.segment(first + 100).is_err());
+    }
+
+    #[test]
+    fn a_question_more_than_90_seconds_before_the_statement_is_not_its_context() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let add = |t: i64, speaker, text: &str| {
+            let id = store.insert_segment(hearing, t, speaker).unwrap();
+            store.finish_segment(id, text, t + 5_000).unwrap();
+            id
+        };
+        add(0, Speaker::Other, "¿Dónde estaba usted?");
+
+        // The question ends at 5 s.
+        assert_eq!(
+            store.question_before(hearing, 95_000).unwrap().as_deref(),
+            Some("¿Dónde estaba usted?")
+        );
+        assert_eq!(store.question_before(hearing, 95_001).unwrap(), None);
+    }
+
+    #[test]
+    fn search_any_finds_chunks_with_some_of_the_words_best_first() {
+        let (store, case) = store_with_case();
+        let evidence = import(&store, case, &temp_file("acta.txt", b"x"));
+        store
+            .save_analysis(
+                evidence,
+                &[
+                    text_page(1, "El testigo vio un carro rojo."),
+                    text_page(2, DECLARATION),
+                    text_page(3, "El acusado vive en Bogotá desde marzo."),
+                ],
+            )
+            .unwrap();
+        let words = ["acusado", "12", "marzo", "medellín", "\"OR", "*"].map(String::from);
+
+        let hits = store.search_any(case, &words, 20).unwrap();
+
+        let pages: Vec<u32> = hits.iter().map(|hit| hit.page).collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], 2, "the chunk with more words is first");
+        assert!(store.search_any(case, &[], 20).unwrap().is_empty());
     }
 }

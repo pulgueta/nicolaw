@@ -45,6 +45,38 @@ The live strip under the top navigation shows the live hearing on every case and
 
 Cmd+Q, **Salir**, and the window close all save the recording before Nicolaw quits: the audio file and the end of the hearing first, then the last segments. A refine pass stops at its next segment.
 
+## Analysis
+
+During a hearing, Nicolaw analyzes each finished answer of the accused (the segments with the speaker **Acusado**). The question before the answer gives the context, only when it ends at most 90 seconds before the answer and no other answer of the accused is between them.
+
+1. The language model writes the factual claims of the answer as standalone Spanish sentences (at most 5).
+2. A full-text search finds the evidence passages of the case for each claim (top 20).
+3. The NLI model scores each pair of a claim and a passage, in both directions.
+4. For a flagged pair, the language model explains the possible conflict and quotes the exact words of the claim and of the evidence. Nicolaw checks that each quote is an exact part of its source.
+
+| Model | Use | Download |
+| --- | --- | --- |
+| [mDeBERTa-v3 multilingual NLI](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7) (MIT) | Probability that a passage contradicts a claim | About 575 MB |
+| [Qwen3 4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) (Apache 2.0) | Claims and explanations | Q4_K_M, about 2.5 GB |
+
+Both models run with [candle](https://github.com/huggingface/candle) on the GPU (Metal). Nicolaw downloads them into the Hugging Face cache when you select **Descargar** in the **Sugerencias** panel. Without them, Nicolaw still records and transcribes the hearing.
+
+A suggestion is **Posible conflicto** when the NLI model gives a high probability of contradiction and the language model agrees. Every other flagged pair is **Revisar**. Suggestions are not verdicts. Nicolaw does not score credibility and does not say who lies. A suggestion only shows a statement and an evidence passage that may not agree, with the file name and the page, so that the lawyer can read the source. Suggestions wait in the panel until the lawyer selects **Confirmar** or **Descartar**.
+
+Each answer of the accused shows its analysis state in the transcript: analyzed, no verifiable claim, no passage found, failed, or not analyzed (with **Reintentar** after the hearing). No passage and no suggestion do not confirm a statement. When the text of a segment changes (refine) or its speaker changes, its open suggestions become stale; confirmed and dismissed suggestions stay. Nicolaw stores new suggestions only after the full analysis succeeds, and a dismissed suggestion does not come back as an open one. The analysis models unload after **Finalizar**, when no answer waits, and a new load waits until the last models are free.
+
+## Privacy
+
+Everything stays on this machine. Nicolaw sends no evidence, audio, transcript, or suggestion to a server. The network is used only to download models when you select **Descargar**.
+
+| Data | Location |
+| --- | --- |
+| Cases, evidence files, extracted text, transcripts, suggestions | `~/Library/Application Support/nicolaw/nicolaw.db` (SQLite) |
+| Hearing audio | `~/Library/Application Support/nicolaw/hearings/<id>.wav` |
+| Models | The Hugging Face cache (`~/.cache/huggingface/hub`) and Handy's model folder |
+
+To remove data from the app, delete the hearing or the file in Nicolaw. See [Deletion](#deletion) for what deletion does not erase. Evidence text goes into the prompts of the language model as data inside tagged blocks, never as instructions.
+
 ## Deletion
 
 When you delete a file in Nicolaw, Nicolaw removes the app's data of the file: its stored copy, its extracted text, and the copy that **Abrir** wrote to the temporary folder (`$TMPDIR/nicolaw/<id>`). Nicolaw also removes old **Abrir** copies when it starts. Deletion does not erase the original file that you added, and it does not erase the free pages of the database or the copies in your backups. It is not a secure erasure.

@@ -653,6 +653,11 @@ impl HearingsView {
                 self.segments.push(segment);
                 self.transcript_scroll.scroll_to_bottom();
             }
+            Event::Discarded { segment_id } => {
+                if self.partial.as_ref().map(|partial| partial.segment_id) == Some(segment_id) {
+                    self.partial = None;
+                }
+            }
             Event::Refined { segment_id, text } => {
                 if let Some(segment) = self
                     .segments

@@ -46,6 +46,10 @@ pub enum Event {
     },
     /// A segment ended and is stored with its final text.
     Final(Segment),
+    /// A segment ended without text and is not kept. Its partial text is no longer valid.
+    Discarded {
+        segment_id: i64,
+    },
     /// The refine pass replaced the text of a segment.
     Refined {
         segment_id: i64,
@@ -243,6 +247,8 @@ impl Processor {
             Err(error) => {
                 current.failed = true;
                 events.push(Event::Error(error));
+                // Close the stream, so that the next segment can begin.
+                self.transcriber.finish().ok();
             }
         }
         if self.refine.is_some() {
@@ -274,6 +280,11 @@ impl Processor {
             store.finish_segment(current.id, &text, t_end_ms)
         };
         drop(store);
+        if text.is_empty() {
+            events.push(Event::Discarded {
+                segment_id: current.id,
+            });
+        }
         if stored.is_err() {
             events.push(Event::Error(AudioError::Storage));
             return;
@@ -559,6 +570,69 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(first, [i16::MAX / 2, i16::MAX / 2]);
+    }
+
+    #[test]
+    fn after_a_feed_error_the_next_segment_can_begin() {
+        let setup = setup("feed-error");
+        let mut transcriber = FakeTranscriber::new("Sí.");
+        transcriber.failed_feeds = 1;
+        let mut processor = Processor::new(
+            setup.hearing,
+            &setup.wav,
+            setup.store.clone(),
+            setup.accused.clone(),
+            Box::new(FakeVad),
+            Box::new(transcriber),
+            None,
+        )
+        .unwrap();
+
+        let mut events = frames(&mut processor, 5, 0.5);
+        events.extend(frames(&mut processor, 19, 0.0));
+        events.extend(frames(&mut processor, 5, 0.5));
+        events.extend(frames(&mut processor, 19, 0.0));
+
+        assert_eq!(finals(&events), [("Sí.".to_owned(), Speaker::Other)]);
+        let errors = events
+            .iter()
+            .filter(|event| matches!(event, Event::Error(_)))
+            .count();
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn a_segment_with_a_partial_and_no_final_text_is_discarded() {
+        let setup = setup("discarded");
+        let mut transcriber = FakeTranscriber::new("Sí.");
+        transcriber.failed_feeds = 1;
+        let mut processor = Processor::new(
+            setup.hearing,
+            &setup.wav,
+            setup.store.clone(),
+            setup.accused.clone(),
+            Box::new(FakeVad),
+            Box::new(transcriber),
+            None,
+        )
+        .unwrap();
+        let mut events = frames(&mut processor, 5, 0.5);
+        events.extend(frames(&mut processor, 19, 0.0));
+
+        let id = events.iter().find_map(|event| match event {
+            Event::Discarded { segment_id } => Some(*segment_id),
+            _ => None,
+        });
+        assert!(id.is_some());
+        assert!(
+            setup
+                .store
+                .lock()
+                .unwrap()
+                .segments(setup.hearing)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

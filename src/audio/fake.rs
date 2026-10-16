@@ -96,11 +96,15 @@ impl Vad for FakeVad {
 }
 
 /// Shows "<first words>" + " <last word>" while the segment is open, then returns `text`.
-/// An empty `text` is a segment with no words.
+/// An empty `text` is a segment with no words. Like a streaming model, it refuses `begin` while
+/// a segment is open.
 pub struct FakeTranscriber {
     pub text: String,
     /// Audio samples of the open segment.
     pub samples: usize,
+    /// The number of next `feed` calls that fail.
+    pub failed_feeds: usize,
+    open: bool,
 }
 
 impl FakeTranscriber {
@@ -108,17 +112,26 @@ impl FakeTranscriber {
         Self {
             text: text.to_owned(),
             samples: 0,
+            failed_feeds: 0,
+            open: false,
         }
     }
 }
 
 impl Transcriber for FakeTranscriber {
     fn begin(&mut self) -> Result<(), AudioError> {
+        if std::mem::replace(&mut self.open, true) {
+            return Err(AudioError::Transcription);
+        }
         self.samples = 0;
         Ok(())
     }
 
     fn feed(&mut self, audio: &[f32]) -> Result<Option<Partial>, AudioError> {
+        if self.failed_feeds > 0 {
+            self.failed_feeds -= 1;
+            return Err(AudioError::Transcription);
+        }
         self.samples += audio.len();
         let words: Vec<&str> = self.text.split_whitespace().collect();
         let Some((last, first)) = words.split_last() else {
@@ -131,6 +144,7 @@ impl Transcriber for FakeTranscriber {
     }
 
     fn finish(&mut self) -> Result<String, AudioError> {
+        self.open = false;
         Ok(self.text.clone())
     }
 }

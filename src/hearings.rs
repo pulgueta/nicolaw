@@ -39,7 +39,7 @@ use crate::models::{
     NEMOTRON, SILERO_VAD,
 };
 use crate::review::analyzer::{self, Analyzer, Job, JobQueue, ModelGate, text_hash};
-use crate::review::{ReviewBackend, ReviewError, ReviewEvent};
+use crate::review::{Decision, ReviewBackend, ReviewError, ReviewEvent};
 use crate::store::{
     AnalysisState, Hearing, Segment, Speaker, Store, Suggestion, SuggestionCounts, SuggestionKind,
     SuggestionLevel, SuggestionStatus, locator_label,
@@ -3450,8 +3450,9 @@ impl HearingsView {
             )
     }
 
-    /// One suggestion: level, kind, the claim with the conflicting words in bold, the
-    /// evidence passage with its file and page, the explanation, and the decision buttons.
+    /// One suggestion: level, kind, the decision step, the claim with the conflicting words in
+    /// bold, the evidence passage with its file and page, the explanation, and the decision
+    /// buttons.
     fn render_card(
         &self,
         suggestion: &Suggestion,
@@ -3575,6 +3576,15 @@ impl HearingsView {
                     )
                     .children(status),
             )
+            .children(suggestion.decision.map(|decision| {
+                div()
+                    .id(("decision", id as u64))
+                    .child(Tag::secondary().small().child(decision_label(
+                        decision,
+                        suggestion.decision_p.unwrap_or(0.0),
+                    )))
+                    .test_support()
+            }))
             .children(stale)
             .child(
                 // The claim is a sentence that the language model wrote, not a quote: the
@@ -3767,6 +3777,17 @@ pub fn kind_label(kind: SuggestionKind) -> &'static str {
     }
 }
 
+/// The decision step and its probability, for example `Contradice · 92 %`.
+pub fn decision_label(decision: Decision, probability: f64) -> String {
+    let name = match decision {
+        Decision::Contradicts => "Contradice",
+        Decision::Consistent => "Compatible",
+        Decision::Unrelated => "No relacionada",
+        Decision::Insufficient => "Insuficiente",
+    };
+    format!("{name} · {:.0} %", probability * 100.0)
+}
+
 /// One transcript item: a small row with the time, the speaker, a note, and the actions (the
 /// correction of the speaker and the analysis state),
 /// then the statement at full width.
@@ -3878,7 +3899,8 @@ mod tests {
 
     use super::{
         Filter, HearingsEnv, HearingsView, Recording, SAVE_ERROR, StartRecording, SwitchSpeaker,
-        TogglePause, format_time, register_actions, render_live_strip, speaker_label, status_text,
+        TogglePause, decision_label, format_time, register_actions, render_live_strip,
+        speaker_label, status_text,
     };
     use crate::audio::fake::FakeBackend;
     use crate::audio::pipeline::Event;
@@ -3887,6 +3909,7 @@ mod tests {
     use crate::models::{
         ANALYSIS_MODELS, COHERE, ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model,
     };
+    use crate::review::Decision;
     use crate::review::ReviewEvent;
     use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
     use crate::store::{
@@ -4143,6 +4166,26 @@ mod tests {
     fn speakers_have_spanish_labels() {
         assert_eq!(speaker_label(Speaker::Accused), "Acusado");
         assert_eq!(speaker_label(Speaker::Other), "Otra persona");
+    }
+
+    #[test]
+    fn decisions_have_spanish_labels_with_a_percent() {
+        assert_eq!(
+            decision_label(Decision::Contradicts, 0.918),
+            "Contradice · 92 %"
+        );
+        assert_eq!(
+            decision_label(Decision::Consistent, 1.0),
+            "Compatible · 100 %"
+        );
+        assert_eq!(
+            decision_label(Decision::Unrelated, 0.5),
+            "No relacionada · 50 %"
+        );
+        assert_eq!(
+            decision_label(Decision::Insufficient, 0.004),
+            "Insuficiente · 0 %"
+        );
     }
 
     #[gpui_kit::test]
@@ -4724,6 +4767,36 @@ mod tests {
         });
         assert!(shown(cx, window, ("confirm", id)));
         assert!(shown(cx, window, ("source", id)));
+    }
+
+    #[gpui_kit::test]
+    async fn a_card_shows_the_decision_only_when_the_suggestion_has_one(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "decision");
+        let (hearing, segment) = add_hearing(&store, case);
+        let mut decided = new_suggestion(hearing, segment, chunk, SuggestionLevel::Check);
+        decided.decision = Some(Decision::Insufficient);
+        decided.decision_p = Some(0.61);
+        let decided = store.insert_suggestion(&decided).unwrap().id as u64;
+        let undecided = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Check,
+            ))
+            .unwrap()
+            .id as u64;
+        let dirs = model_dirs("decision", true);
+        let (window, _) = open_pair("decision", store, case, &FakeBackend::new(""), &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("suggestion", undecided)).is_some()
+        })
+        .await;
+
+        assert!(shown(cx, window, ("decision", decided)));
+        assert!(!shown(cx, window, ("decision", undecided)));
     }
 
     #[gpui_kit::test]

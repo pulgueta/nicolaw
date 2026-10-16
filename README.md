@@ -52,18 +52,27 @@ During a hearing, Nicolaw analyzes each finished answer of the accused (the segm
 1. The language model writes the factual claims of the answer as standalone Spanish sentences (at most 5).
 2. A full-text search finds the evidence passages of the case for each claim (top 20).
 3. The NLI model scores each pair of a claim and a passage, in both directions.
-4. For a flagged pair, the language model explains the possible conflict and quotes the exact words of the claim and of the evidence. Nicolaw checks that each quote is an exact part of its source.
+4. For a flagged pair, the language model answers one choice question with four options: **contradicts**, **consistent**, **unrelated**, or **insufficient** (abstain). Nicolaw reads the probability of each option from one forward pass, not from generated text.
+5. For a flagged pair, the language model explains the possible conflict and quotes the exact words of the claim and of the evidence. Nicolaw checks that each quote is an exact part of its source.
 
 | Model | Use | Download |
 | --- | --- | --- |
 | [mDeBERTa-v3 multilingual NLI](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7) (MIT) | Probability that a passage contradicts a claim | About 575 MB |
-| [Qwen3 4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) (Apache 2.0) | Claims and explanations | Q4_K_M, about 2.5 GB |
+| [Qwen3 4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) (Apache 2.0) | Claims, decisions, and explanations | Q4_K_M, about 2.5 GB |
 
 Both models run with [candle](https://github.com/huggingface/candle) on the GPU (Metal). Nicolaw downloads them into the Hugging Face cache when you select **Descargar** in the **Sugerencias** panel. Without them, Nicolaw still records and transcribes the hearing.
 
-A suggestion is **Posible conflicto** when the NLI model gives a high probability of contradiction and the language model agrees. Every other flagged pair is **Revisar**. Suggestions are not verdicts. Nicolaw does not score credibility and does not say who lies. A suggestion only shows a statement and an evidence passage that may not agree, with the file name and the page, so that the lawyer can read the source. Suggestions wait in the panel until the lawyer selects **Confirmar** or **Descartar**.
+A suggestion is **Posible conflicto** when the NLI model gives a high probability of contradiction, the decision is **contradicts** with a probability of at least 60 %, and the explanation agrees. Every other flagged pair is **Revisar**. Each card shows the decision and its probability, for example **Contradice · 92 %** or **Insuficiente · 70 %**. Suggestions are not verdicts. Nicolaw does not score credibility and does not say who lies. A suggestion only shows a statement and an evidence passage that may not agree, with the file name and the page, so that the lawyer can read the source. Suggestions wait in the panel until the lawyer selects **Confirmar** or **Descartar**.
 
 Each answer of the accused shows its analysis state in the transcript: analyzed, no verifiable claim, no passage found, failed, or not analyzed (with **Reintentar** after the hearing). No passage and no suggestion do not confirm a statement. When the text of a segment changes (refine) or its speaker changes, its open suggestions become stale; confirmed and dismissed suggestions stay. Nicolaw stores new suggestions only after the full analysis succeeds, and a dismissed suggestion does not come back as an open one. The analysis models unload after **Finalizar**, when no answer waits, and a new load waits until the last models are free.
+
+### Why not Jev
+
+The decision step follows the `choice` question of [Jev](https://developers.cloudflare.com/ai/models/typesafe/jev/) (TypeSafe AI): described options, and one probability for each option. Jev itself is API-only, and its weights are not published, so Nicolaw cannot run it locally.
+[Cloudflare Clef and Clef-flash](https://developers.cloudflare.com/changelog/post/2026-10-01-clef-workers-ai/) (Apache 2.0) use the same System One API, but candle cannot load them, and the [published language list](https://huggingface.co/Cloudflare/clef-flash) has English only.
+The mDeBERTa NLI model stays the first stage: it has a published Spanish result (XNLI-es 0.832).
+The decision step runs on the Qwen3 4B that Nicolaw already loads. It scores the first token of each option label (option-logit scoring), with a softmax over the four options only.
+The thresholds (the NLI thresholds and the 60 % decision minimum) are initial values. Tune them on labeled Spanish hearing data.
 
 ## Privacy
 

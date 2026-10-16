@@ -71,6 +71,13 @@ pub trait Llm: Send {
 /// Natural language inference: does the premise contradict the hypothesis?
 pub trait Nli: Send {
     fn score(&mut self, premise: &str, hypothesis: &str) -> Result<NliScores, ReviewError>;
+
+    /// True when the pair fits the model input with no truncation. Without a tokenizer, the
+    /// pair has at most [`parse::MAX_PAIR_WORDS`] words.
+    fn fits(&self, premise: &str, hypothesis: &str) -> bool {
+        premise.split_whitespace().count() + hypothesis.split_whitespace().count()
+            <= parse::MAX_PAIR_WORDS
+    }
 }
 
 /// The loaded analysis models.

@@ -32,10 +32,17 @@ impl ReviewBackend for NativeReview {
     fn load(&self, nli: &[PathBuf], llm: &[PathBuf]) -> Result<Engines, ReviewError> {
         let nli = nli.to_vec();
         let llm = llm.to_vec();
+        // A copy of the tokenizer, with no truncation, measures the pairs.
+        let mut tokenizer = nli
+            .get(1)
+            .and_then(|path| Tokenizer::from_file(path).ok())
+            .ok_or(ReviewError::ModelLoad)?;
+        tokenizer.with_truncation(None).map_err(load_error)?;
         Ok(Engines {
-            nli: Box::new(NativeNli(ModelThread::spawn("nicolaw-nli", move || {
-                Deberta::load(&nli, device())
-            })?)),
+            nli: Box::new(NativeNli {
+                thread: ModelThread::spawn("nicolaw-nli", move || Deberta::load(&nli, device()))?,
+                tokenizer,
+            }),
             llm: Box::new(NativeLlm(ModelThread::spawn("nicolaw-llm", move || {
                 Qwen::load(&llm, device())
             })?)),
@@ -125,13 +132,22 @@ fn inference_error(_: impl std::fmt::Debug) -> ReviewError {
     ReviewError::Inference
 }
 
-struct NativeNli(ModelThread<Deberta>);
+struct NativeNli {
+    thread: ModelThread<Deberta>,
+    tokenizer: Tokenizer,
+}
 
 impl Nli for NativeNli {
     fn score(&mut self, premise: &str, hypothesis: &str) -> Result<NliScores, ReviewError> {
         let (premise, hypothesis) = (premise.to_owned(), hypothesis.to_owned());
-        self.0
+        self.thread
             .call(move |model| model.score(&premise, &hypothesis))?
+    }
+
+    fn fits(&self, premise: &str, hypothesis: &str) -> bool {
+        self.tokenizer
+            .encode((premise, hypothesis), true)
+            .is_ok_and(|encoding| encoding.len() <= NLI_MAX_TOKENS)
     }
 }
 
@@ -206,6 +222,9 @@ impl Deberta {
             .tokenizer
             .encode((premise, hypothesis), true)
             .map_err(inference_error)?;
+        if !encoding.get_overflowing().is_empty() {
+            eprintln!("Nicolaw NLI: truncated: the pair is longer than {NLI_MAX_TOKENS} tokens");
+        }
         let ids = Tensor::new(encoding.get_ids(), &self.device)
             .and_then(|ids| ids.unsqueeze(0))
             .map_err(inference_error)?;

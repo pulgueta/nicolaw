@@ -156,7 +156,7 @@ impl Analyzer {
         for hit in hits {
             let chunk = self.store.lock().unwrap().chunk(hit.chunk_id)?;
             let mut best: Option<Flagged> = None;
-            for premise in premises(&chunk.text) {
+            for premise in premises(&chunk.text, |premise| self.nli.fits(premise, claim)) {
                 if self.cancelled() {
                     return Ok(Vec::new());
                 }

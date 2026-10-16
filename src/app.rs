@@ -1404,6 +1404,9 @@ fn import_message(error: ImportError, name: &str) -> String {
             format!("\"{name}\" pesa más de 100 MB. Nicolaw no agregó el archivo.")
         }
         ImportError::Read => format!("Nicolaw no puede leer \"{name}\"."),
+        ImportError::Changed => {
+            format!("\"{name}\" cambió durante la carga. Nicolaw no agregó el archivo.")
+        }
         ImportError::Storage => "Nicolaw no puede guardar el archivo. Intente de nuevo.".to_owned(),
     }
 }

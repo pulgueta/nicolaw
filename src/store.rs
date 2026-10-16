@@ -144,6 +144,8 @@ pub struct SearchHit {
 pub enum ImportError {
     TooLarge,
     Read,
+    /// The file changed size during the import.
+    Changed,
     Storage,
 }
 
@@ -275,6 +277,13 @@ impl Store {
                     break;
                 }
             }
+        }
+        // The file became longer after the metadata read, so the copy is not complete.
+        let mut file = file.into_inner();
+        let more = file.read(&mut [0]).map_err(|_| ImportError::Read)?;
+        let len = file.metadata().map_err(|_| ImportError::Read)?.len();
+        if more != 0 || len != size {
+            return Err(ImportError::Changed);
         }
         let sha256: String = hasher
             .finalize()
@@ -776,6 +785,22 @@ mod tests {
             store.import(case, &path, |_, _| {}),
             Err(ImportError::TooLarge)
         ));
+        assert!(store.list(case).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_that_grows_during_import_is_rejected() {
+        let (store, case) = store_with_case();
+        let path = temp_file("grows.txt", b"abc");
+
+        let result = store.import(case, &path, |done, total| {
+            if done == total {
+                let mut file = fs::File::options().append(true).open(&path).unwrap();
+                std::io::Write::write_all(&mut file, b"d").unwrap();
+            }
+        });
+
+        assert!(matches!(result, Err(ImportError::Changed)));
         assert!(store.list(case).unwrap().is_empty());
     }
 

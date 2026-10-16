@@ -1,0 +1,25 @@
+claim	passage	label	family
+El acusado rindió su declaración en Medellín el 12 de marzo de 2024.	La declaración del acusado fue rendida el 12 de marzo de 2024 en Bogotá.	contradicts	declaracion
+El acusado declaró en Bogotá en marzo de 2024.	La declaración del acusado fue rendida el 12 de marzo de 2024 en Bogotá.	consistent	declaracion
+El acusado tiene un perro llamado Max.	La declaración del acusado fue rendida el 12 de marzo de 2024 en Bogotá.	unrelated	declaracion
+El acusado declaró a las diez de la mañana.	La declaración del acusado fue rendida el 12 de marzo de 2024 en Bogotá.	insufficient	declaracion
+Según el testigo, el vehículo era de color azul.	El testigo afirmó que el vehículo era de color rojo.	contradicts	vehiculo
+El testigo dijo que el carro era rojo.	El testigo afirmó que el vehículo era de color rojo.	consistent	vehiculo
+El acusado pagó la renta en efectivo.	El testigo afirmó que el vehículo era de color rojo.	unrelated	vehiculo
+El vehículo tenía placas de Bogotá.	El testigo afirmó que el vehículo era de color rojo.	insufficient	vehiculo
+Carlos Pérez salió del Hotel Andino el 13 de marzo de 2024.	El señor Carlos Pérez se registró el 12 de marzo de 2024 a las 8:00 p. m. en la habitación 204 del Hotel Andino de Medellín y salió el 14 de marzo.	contradicts	hotel-medellin
+Carlos Pérez se hospedó en el Hotel Andino en marzo de 2024.	El señor Carlos Pérez se registró el 12 de marzo de 2024 a las 8:00 p. m. en la habitación 204 del Hotel Andino de Medellín y salió el 14 de marzo.	consistent	hotel-medellin
+El testigo vio un carro rojo frente a la casa.	El señor Carlos Pérez se registró el 12 de marzo de 2024 a las 8:00 p. m. en la habitación 204 del Hotel Andino de Medellín y salió el 14 de marzo.	unrelated	hotel-medellin
+Carlos Pérez viajó a Medellín en avión.	El señor Carlos Pérez se registró el 12 de marzo de 2024 a las 8:00 p. m. en la habitación 204 del Hotel Andino de Medellín y salió el 14 de marzo.	insufficient	hotel-medellin
+Carlos Pérez pagó la habitación con tarjeta de crédito.	El señor Carlos Pérez pagó 450.000 pesos en efectivo por la habitación.	contradicts	pago
+Carlos Pérez pagó 450.000 pesos por la habitación.	El señor Carlos Pérez pagó 450.000 pesos en efectivo por la habitación.	consistent	pago
+El acusado estudió derecho en Cali.	El señor Carlos Pérez pagó 450.000 pesos en efectivo por la habitación.	unrelated	pago
+Carlos Pérez pagó la habitación el día de su llegada.	El señor Carlos Pérez pagó 450.000 pesos en efectivo por la habitación.	insufficient	pago
+El acusado nunca estuvo en Bogotá en marzo de 2024.	Según el registro del hotel, el acusado estaba en Bogotá el 12 de marzo de 2024.	contradicts	hotel-bogota
+El acusado estaba en Bogotá el 12 de marzo.	Según el registro del hotel, el acusado estaba en Bogotá el 12 de marzo de 2024.	consistent	hotel-bogota
+La audiencia empezó a las nueve de la mañana.	Según el registro del hotel, el acusado estaba en Bogotá el 12 de marzo de 2024.	unrelated	hotel-bogota
+El acusado estaba con su hermano el 12 de marzo de 2024.	Según el registro del hotel, el acusado estaba en Bogotá el 12 de marzo de 2024.	insufficient	hotel-bogota
+El 3 de abril de 2024 el acusado transfirió un millón de pesos a su hermana.	El 3 de abril de 2024 el acusado transfirió dos millones de pesos a la cuenta de su hermana.	contradicts	transferencia
+El acusado le envió dinero a su hermana en abril de 2024.	El 3 de abril de 2024 el acusado transfirió dos millones de pesos a la cuenta de su hermana.	consistent	transferencia
+El vehículo era de color rojo.	El 3 de abril de 2024 el acusado transfirió dos millones de pesos a la cuenta de su hermana.	unrelated	transferencia
+El acusado transfirió el dinero desde un banco de Cali.	El 3 de abril de 2024 el acusado transfirió dos millones de pesos a la cuenta de su hermana.	insufficient	transferencia

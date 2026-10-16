@@ -574,6 +574,108 @@ mod tests {
         }
     }
 
+    /// One labeled pair of the calibration set: claim, passage, label, family.
+    type Pair = (String, String, crate::review::Decision, String);
+
+    /// Reads a calibration file (see `tests/fixtures/calibration/README.md`).
+    fn calibration_pairs(text: &str) -> Vec<Pair> {
+        text.lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let [claim, passage, label, family] = fields[..] else {
+                    panic!("not 4 fields: {line}");
+                };
+                let label = crate::review::Decision::parse(label)
+                    .unwrap_or_else(|| panic!("unknown label: {label}"));
+                (claim.into(), passage.into(), label, family.into())
+            })
+            .collect()
+    }
+
+    fn seed_pairs() -> Vec<Pair> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/calibration/seed.tsv");
+        calibration_pairs(&std::fs::read_to_string(path).unwrap())
+    }
+
+    #[test]
+    fn the_calibration_seed_has_six_families_with_each_label() {
+        use crate::review::Decision;
+
+        let pairs = seed_pairs();
+
+        assert_eq!(pairs.len(), 24);
+        let mut families: Vec<&str> = pairs.iter().map(|pair| pair.3.as_str()).collect();
+        families.sort();
+        families.dedup();
+        assert_eq!(families.len(), 6);
+        for family in families {
+            for label in Decision::ALL {
+                assert_eq!(
+                    pairs
+                        .iter()
+                        .filter(|pair| pair.3 == family && pair.2 == label)
+                        .count(),
+                    1,
+                    "{family} {label:?}"
+                );
+            }
+        }
+    }
+
+    /// Scores the calibration seed with the installed models, and prints each pair and a
+    /// confusion table of the decision step. It does not check accuracy: the seed is too small.
+    ///
+    /// ```sh
+    /// cargo test real_calibration_pairs_report -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the installed analysis models"]
+    fn real_calibration_pairs_report() {
+        use crate::review::Decision;
+        use crate::review::prompt::decision_prompt;
+
+        let pairs = seed_pairs();
+        let nli = Deberta::load(&files(&NLI), device()).unwrap();
+        let mut qwen = Qwen::load(&files(&LLM), device()).unwrap();
+        // confusion[label][decision]
+        let mut confusion = [[0u32; 4]; 4];
+        let index = |decision: Decision| {
+            Decision::ALL
+                .iter()
+                .position(|&other| other == decision)
+                .unwrap()
+        };
+        println!("family\tlabel\tdecision\tscore\tnli_contradiction\tclaim");
+        for (claim, passage, label, family) in &pairs {
+            let scores = nli
+                .score(passage, claim)
+                .unwrap()
+                .max(nli.score(claim, passage).unwrap());
+            let (decision, score) = qwen
+                .decide(&decision_prompt(claim, passage))
+                .unwrap()
+                .best();
+            confusion[index(*label)][index(decision)] += 1;
+            println!(
+                "{family}\t{}\t{}\t{score:.3}\t{:.3}\t{claim}",
+                label.as_str(),
+                decision.as_str(),
+                scores.contradiction
+            );
+        }
+        println!("\nlabel \\ decision\tcontradicts\tconsistent\tunrelated\tinsufficient");
+        for (label, row) in Decision::ALL.iter().zip(confusion) {
+            println!(
+                "{}\t{}",
+                label.as_str(),
+                row.map(|count| count.to_string()).join("\t")
+            );
+        }
+    }
+
     /// Runs the full analysis with the real models: a hearing answer of the accused against a
     /// hotel register in the case.
     ///

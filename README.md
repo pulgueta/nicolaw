@@ -74,6 +74,18 @@ The mDeBERTa NLI model stays the first stage: it has a published Spanish result 
 The decision step runs on the Qwen3 4B that Nicolaw already loads. It scores the first token of each option label (option-logit scoring), with a softmax over the four options only.
 The thresholds (the NLI thresholds and the 60 % decision minimum) are initial values. Tune them on labeled Spanish hearing data.
 
+### Calibration
+
+The thresholds are initial values, not calibrated ones: `CONFLICT_MIN` 0.85, the margin 0.5, and `CHECK_MIN` 0.60 for the NLI model, and `DECISION_MIN` 0.60 for the decision step. The scores of the decision step are often near 0 or 1. They are model scores, not probabilities that a statement is true or false. The plan for a first calibration (a pilot, not a courtroom validation):
+
+- 240 labeled Spanish pairs of a claim and a passage: 60 for each label (contradicts, consistent, unrelated, insufficient). Two Spanish-speaking reviewers label each pair from the passage only, and keep the reasons for each disagreement.
+- At least 24 fact families: dates, time ranges, amounts, places, identities, sequences, negation, pronouns, hearsay, "no recuerdo", OCR damage, and speech recognition errors. All the paraphrases and the OCR and file variants of one fact stay in one family.
+- 160 pairs for tuning and 80 locked pairs for the test, balanced by label. A family is only in one split.
+- On the tuning pairs only, sweep `CONFLICT_MIN` 0.80, 0.85, 0.90, 0.95; the margin 0.30, 0.50, 0.70; and `DECISION_MIN` 0.60, 0.75, 0.90, 0.95. Keep `CHECK_MIN` in the results. Try temperature scaling on the saved option logits, and the order of the option labels.
+- Run the locked pairs one time with the selected values. Report the confusion counts, the precision and the recall of conflicts, the false conflicts, the abstention rate, the retrieval recall, and the review workload, with confidence intervals.
+
+The file format and a 24-pair synthetic seed are in [`tests/fixtures/calibration`](tests/fixtures/calibration/README.md). `cargo test real_calibration_pairs_report -- --ignored --nocapture` prints the scores and the confusion table of a calibration file. It does not check accuracy.
+
 ## Privacy
 
 Everything stays on this machine. Nicolaw sends no evidence, audio, transcript, or suggestion to a server. The network is used only to download models when you select **Descargar**.

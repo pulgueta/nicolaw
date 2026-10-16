@@ -1365,7 +1365,7 @@ mod tests {
     use crate::audio::fake::FakeBackend;
     use crate::audio::pipeline::Event;
     use crate::audio::{AudioError, ModelPaths};
-    use crate::models::{ModelDirs, NEMOTRON, SILERO_VAD};
+    use crate::models::{ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model};
     use crate::store::{Segment, Speaker, Store};
 
     const WAIT: Duration = Duration::from_secs(1);
@@ -1388,8 +1388,8 @@ mod tests {
         };
         fs::create_dir_all(&dirs.handy).unwrap();
         if installed {
-            fs::write(dirs.handy.join(NEMOTRON.file), b"GGUF").unwrap();
-            fs::write(dirs.handy.join(SILERO_VAD.file), b"GGUF").unwrap();
+            write_fake_model(&dirs.handy.join(NEMOTRON.file), &NEMOTRON);
+            write_fake_model(&dirs.handy.join(SILERO_VAD.file), &SILERO_VAD);
         }
         dirs
     }

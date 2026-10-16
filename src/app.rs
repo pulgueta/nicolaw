@@ -993,7 +993,10 @@ impl FilesView {
                                     .flex_1()
                                     .min_w_0()
                                     .gap_0p5()
-                                    .child(div().text_sm().truncate().child(file.name.clone()))
+                                    .child(
+                                        file_name_label(("file-name", id as u64), &file.name)
+                                            .test_support(),
+                                    )
                                     .child(div().text_xs().text_color(muted).child(format!(
                                         "{} · {}",
                                         preview::type_label(&file.name),
@@ -1123,12 +1126,23 @@ impl FilesView {
                             .gap_2()
                             .justify_between()
                             .when(best, |row| {
-                                row.child(file_name_label(
-                                    ("hit-name", hit.chunk_id as u64),
-                                    &group.evidence_name,
-                                ))
+                                row.child(
+                                    file_name_label(
+                                        ("hit-name", hit.chunk_id as u64),
+                                        &group.evidence_name,
+                                    )
+                                    .test_support(),
+                                )
                             })
-                            .child(div().flex_none().text_xs().text_color(muted).child(locator)),
+                            .child(
+                                div()
+                                    .id(("hit-locator", hit.chunk_id as u64))
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(locator)
+                                    .test_support(),
+                            ),
                     )
                     .child(
                         div()
@@ -1946,6 +1960,59 @@ mod tests {
         assert!(!copy.exists());
         assert!(!root.join(id.to_string()).exists());
         assert!(path.exists(), "the original file must stay");
+    }
+
+    #[gpui_kit::test]
+    async fn a_long_file_name_is_cut_and_never_hides_the_status_or_the_locator(
+        cx: &mut TestAppContext,
+    ) {
+        let name = format!(
+            "{}.txt",
+            "declaración del testigo principal ".repeat(6).trim()
+        );
+        let path = temp_dir("long-name").join(&name);
+        fs::write(&path, "x").unwrap();
+        let (store, case) = store_with_case();
+        let id = store.import(case, &path, |_, _| {}).unwrap().id;
+        let page = Page {
+            number: 1,
+            text: "El testigo habló.".into(),
+            source: PageSource::Text,
+        };
+        store.save_analysis(id, &[page]).unwrap();
+        let chunk = store.search_groups(case, "testigo", 1).unwrap()[0].hits[0].chunk_id;
+        let (window, _) = open(store, cx);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("file", id as u64)).is_some()
+        })
+        .await;
+
+        cx.update_window(window, |_, window, _| {
+            let pane = window.find("list-pane").bounds();
+            let name = window.find(("file-name", id as u64)).bounds();
+            let status = window.find(("status", id as u64)).bounds();
+            assert!(name.right() <= status.left());
+            assert!(status.right() <= pane.right());
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.click("search", cx);
+            window.input("testigo", cx);
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hit-locator", chunk as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, _| {
+            let pane = window.find("list-pane").bounds();
+            let name = window.find(("hit-name", chunk as u64)).bounds();
+            let locator = window.find(("hit-locator", chunk as u64)).bounds();
+            assert!(name.right() <= locator.left());
+            assert!(locator.right() <= pane.right());
+            assert!(locator.size.width > px(40.));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

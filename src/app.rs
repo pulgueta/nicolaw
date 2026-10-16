@@ -2747,6 +2747,7 @@ mod tests {
                 level: SuggestionLevel::Check,
                 nli_contradiction: 0.7,
                 explanation: None,
+                segment_revision: 0,
             })
             .unwrap()
             .id as u64;
@@ -2821,6 +2822,7 @@ mod tests {
                 level: SuggestionLevel::Check,
                 nli_contradiction: 0.7,
                 explanation: None,
+                segment_revision: 0,
             })
             .unwrap()
             .id as u64;

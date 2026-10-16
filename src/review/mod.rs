@@ -11,15 +11,17 @@ pub mod query;
 
 use std::path::PathBuf;
 
-use crate::store::{Suggestion, SuggestionLevel};
+use crate::store::{AnalysisState, Suggestion, SuggestionLevel};
 
 /// What the analysis reports to the UI.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReviewEvent {
     SuggestionAdded(Suggestion),
-    /// A new analysis of a segment removed the old suggestions of the segment.
-    SuggestionsRemoved {
+    /// The analysis of a segment has a new state.
+    Analyzed {
         hearing_id: i64,
+        segment_id: i64,
+        state: AnalysisState,
     },
     /// The number of segments that wait for analysis (with the segment in analysis), and the
     /// number of segments that the full queue dropped.

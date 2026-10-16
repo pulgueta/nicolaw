@@ -9,7 +9,7 @@ use async_channel::TrySendError;
 use super::parse::{Explanation, parse_claims, parse_explanation, premises};
 use super::query::query_terms;
 use super::{Engines, Llm, Nli, ReviewError, ReviewEvent, decide};
-use crate::store::{NewSuggestion, Segment, Speaker, Store, SuggestionLevel};
+use crate::store::{AnalysisState, NewSuggestion, Segment, Speaker, Store, SuggestionLevel};
 
 /// The search gives at most this number of chunks for each claim.
 const SEARCH_LIMIT: usize = 20;
@@ -54,6 +54,30 @@ pub struct Analyzer {
     nli: Box<dyn Nli>,
     /// When true, the analysis stops before the next model call or the next insert.
     cancel: Arc<AtomicBool>,
+    /// The right to keep the models loaded. It is the last field, so that it goes after the
+    /// models.
+    _permit: Option<Permit>,
+}
+
+/// Why the analysis of a segment stopped before its suggestions were stored.
+enum Stop {
+    /// A model or the storage failed.
+    Error(ReviewError),
+    /// The output of the language model is not valid.
+    Malformed,
+    Cancelled,
+}
+
+impl From<ReviewError> for Stop {
+    fn from(error: ReviewError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<rusqlite::Error> for Stop {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Error(error.into())
+    }
 }
 
 impl Analyzer {
@@ -63,6 +87,7 @@ impl Analyzer {
             llm: engines.llm,
             nli: engines.nli,
             cancel: Arc::default(),
+            _permit: None,
         }
     }
 
@@ -72,58 +97,116 @@ impl Analyzer {
         self
     }
 
+    /// The analyzer keeps `permit` until it is dropped, after its models.
+    pub fn with_permit(mut self, permit: Permit) -> Self {
+        self._permit = Some(permit);
+        self
+    }
+
     /// Analyzes one segment: claims, retrieval, NLI, explanation, and storage. Returns the new
-    /// suggestions, then an error if the analysis failed. A segment of an other speaker, or a
-    /// segment whose text changed, gives nothing. The new suggestions of a segment replace its
-    /// old suggestions.
+    /// suggestions and the analysis state of the segment, then an error for the user if the
+    /// storage failed. A segment of an other speaker, or a segment whose text changed, gives
+    /// nothing. The suggestions are stored only when the full analysis succeeds; earlier
+    /// suggestions of the segment stay (see [`Store::replace_suggestions`]).
     pub fn analyze(&mut self, job: &Job) -> Vec<ReviewEvent> {
         let mut events = Vec::new();
-        if let Err(error) = self.try_analyze(job, &mut events) {
-            events.push(ReviewEvent::Error(error.message().into()));
+        let segment = if self.cancelled() {
+            Err(Stop::Cancelled)
+        } else {
+            self.current(job).map_err(Stop::from)
+        };
+        let segment = match segment {
+            Ok(Some(segment)) => segment,
+            Ok(None) => return events,
+            Err(stop) => {
+                self.stopped(job, None, stop, &mut events);
+                return events;
+            }
+        };
+        match self.try_analyze(job, &segment) {
+            Ok((new, state)) => {
+                let stored = self.store.lock().unwrap().replace_suggestions(
+                    job.segment_id,
+                    segment.revision,
+                    &new,
+                    state,
+                );
+                match stored {
+                    // The text or the speaker changed during the analysis: a new job comes.
+                    Ok(None) => {}
+                    Ok(Some(stored)) => {
+                        events.extend(stored.into_iter().map(ReviewEvent::SuggestionAdded));
+                        events.push(analyzed(job, state));
+                    }
+                    Err(error) => {
+                        self.stopped(job, Some(segment.revision), error.into(), &mut events)
+                    }
+                }
+            }
+            Err(stop) => self.stopped(job, Some(segment.revision), stop, &mut events),
         }
         events
     }
 
-    fn try_analyze(&mut self, job: &Job, events: &mut Vec<ReviewEvent>) -> Result<(), ReviewError> {
-        if self.cancelled() {
-            return Ok(());
-        }
-        let Some(segment) = self.current(job)? else {
-            return Ok(());
+    /// Stores the state of an analysis that stopped. A storage error is also reported to
+    /// the user; a model error shows only in the state of the segment.
+    fn stopped(&self, job: &Job, revision: Option<i64>, stop: Stop, events: &mut Vec<ReviewEvent>) {
+        let state = match stop {
+            Stop::Cancelled => AnalysisState::Skipped,
+            Stop::Malformed | Stop::Error(_) => AnalysisState::Failed,
         };
-        let removed = self
+        let saved = self
             .store
             .lock()
             .unwrap()
-            .delete_segment_suggestions(job.segment_id)?;
-        if removed > 0 {
-            events.push(ReviewEvent::SuggestionsRemoved {
-                hearing_id: job.hearing_id,
-            });
+            .set_analysis_state(job.segment_id, revision, state);
+        if matches!(saved, Ok(true)) {
+            events.push(analyzed(job, state));
         }
+        if matches!(stop, Stop::Error(ReviewError::Storage)) || saved.is_err() {
+            events.push(ReviewEvent::Error(ReviewError::Storage.message().into()));
+        }
+    }
+
+    /// The suggestions of the segment and its state, or why the analysis stopped.
+    fn try_analyze(
+        &mut self,
+        job: &Job,
+        segment: &Segment,
+    ) -> Result<(Vec<NewSuggestion>, AnalysisState), Stop> {
         let question = self
             .store
             .lock()
             .unwrap()
             .question_before(job.hearing_id, segment.t_start_ms)?;
-        let claims = parse_claims(&self.llm.claims(question.as_deref(), &segment.text)?);
+        let output = self.llm.claims(question.as_deref(), &segment.text)?;
+        let claims = parse_claims(&output).ok_or(Stop::Malformed)?;
+        if claims.is_empty() {
+            return Ok((Vec::new(), AnalysisState::NoClaim));
+        }
+        let mut new = Vec::new();
+        let mut found = false;
         for claim in claims {
-            for flagged in self.flag(job.case_id, &claim)? {
+            let (hits, flagged) = self.flag(job.case_id, &claim)?;
+            found |= hits > 0;
+            for flagged in flagged {
                 if self.cancelled() {
-                    return Ok(());
+                    return Err(Stop::Cancelled);
                 }
                 let output = self.llm.explain(&claim, &flagged.premise)?;
                 let explanation = parse_explanation(&output, &claim, &flagged.chunk_text);
-                // The refine pass can change the text during the analysis.
-                if self.cancelled() || self.current(job)?.is_none() {
-                    return Ok(());
-                }
-                let new = suggestion(job, &claim, flagged, explanation);
-                let stored = self.store.lock().unwrap().insert_suggestion(&new)?;
-                events.push(ReviewEvent::SuggestionAdded(stored));
+                new.push(suggestion(job, &claim, flagged, explanation));
             }
         }
-        Ok(())
+        if self.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let state = if found {
+            AnalysisState::Complete
+        } else {
+            AnalysisState::NoSource
+        };
+        Ok((new, state))
     }
 
     fn cancelled(&self) -> bool {
@@ -144,21 +227,23 @@ impl Analyzer {
         Ok(current.then_some(segment))
     }
 
-    /// The passages of the case that the NLI model flags for the claim, strongest first, one
-    /// for each chunk, at most [`MAX_SUGGESTIONS_PER_CLAIM`].
-    fn flag(&mut self, case_id: i64, claim: &str) -> Result<Vec<Flagged>, ReviewError> {
+    /// The number of passages that the search found for the claim, and the passages that the
+    /// NLI model flags, strongest first, one for each chunk, at most
+    /// [`MAX_SUGGESTIONS_PER_CLAIM`].
+    fn flag(&mut self, case_id: i64, claim: &str) -> Result<(usize, Vec<Flagged>), Stop> {
         let hits =
             self.store
                 .lock()
                 .unwrap()
                 .search_any(case_id, &query_terms(claim), SEARCH_LIMIT)?;
+        let count = hits.len();
         let mut flagged: Vec<Flagged> = Vec::new();
         for hit in hits {
             let chunk = self.store.lock().unwrap().chunk(hit.chunk_id)?;
             let mut best: Option<Flagged> = None;
             for premise in premises(&chunk.text, |premise| self.nli.fits(premise, claim)) {
                 if self.cancelled() {
-                    return Ok(Vec::new());
+                    return Err(Stop::Cancelled);
                 }
                 // Both directions: the evidence as premise, then the claim as premise.
                 let scores = self
@@ -185,7 +270,15 @@ impl Analyzer {
         }
         flagged.sort_by(|a, b| b.contradiction.total_cmp(&a.contradiction));
         flagged.truncate(MAX_SUGGESTIONS_PER_CLAIM);
-        Ok(flagged)
+        Ok((count, flagged))
+    }
+}
+
+fn analyzed(job: &Job, state: AnalysisState) -> ReviewEvent {
+    ReviewEvent::Analyzed {
+        hearing_id: job.hearing_id,
+        segment_id: job.segment_id,
+        state,
     }
 }
 
@@ -208,6 +301,8 @@ fn suggestion(
         level: SuggestionLevel::Check,
         nli_contradiction: flagged.contradiction as f64,
         explanation: Some(UNVERIFIED_NOTE.to_owned()),
+        // The store sets the revision that the analysis read.
+        segment_revision: 0,
     };
     let Some(explanation) = explanation else {
         return base;
@@ -246,7 +341,8 @@ impl JobQueue {
         }
     }
 
-    pub fn push(&self, mut job: Job) {
+    /// Adds the job. Returns the jobs that the full queue dropped.
+    pub fn push(&self, mut job: Job) -> Vec<Job> {
         // A new job for a segment replaces its pending job: the text of the segment changed.
         let pending: Vec<Job> = std::iter::from_fn(|| self.receiver.try_recv().ok()).collect();
         for old in pending {
@@ -254,17 +350,24 @@ impl JobQueue {
                 self.sender.try_send(old).ok();
             }
         }
+        let mut dropped = Vec::new();
         loop {
             match self.sender.try_send(job) {
-                Ok(()) | Err(TrySendError::Closed(_)) => return,
+                Ok(()) | Err(TrySendError::Closed(_)) => return dropped,
                 Err(TrySendError::Full(back)) => {
-                    if self.receiver.try_recv().is_ok() {
+                    if let Ok(old) = self.receiver.try_recv() {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
+                        dropped.push(old);
                     }
                     job = back;
                 }
             }
         }
+    }
+
+    /// Removes and returns the jobs that wait.
+    pub fn drain(&self) -> Vec<Job> {
+        std::iter::from_fn(|| self.receiver.try_recv().ok()).collect()
     }
 
     /// True if `other` is a clone of this queue.
@@ -293,6 +396,72 @@ impl JobQueue {
     /// Stops the queue. The jobs in it are not analyzed.
     pub fn close(&self) {
         self.sender.close();
+    }
+}
+
+/// Puts a final segment of the accused into the analysis queue, as `waiting`. Without a
+/// queue (the analysis is off), the segment is `skipped`. A job that the full queue drops is
+/// also `skipped`. Returns the new state of each changed segment.
+pub fn submit(
+    store: &Mutex<Store>,
+    queue: Option<&JobQueue>,
+    job: Job,
+) -> rusqlite::Result<Vec<(Job, AnalysisState)>> {
+    let store = store.lock().unwrap();
+    let mut changed = Vec::new();
+    let Some(queue) = queue else {
+        store.set_analysis_state(job.segment_id, None, AnalysisState::Skipped)?;
+        changed.push((job, AnalysisState::Skipped));
+        return Ok(changed);
+    };
+    store.set_analysis_state(job.segment_id, None, AnalysisState::Waiting)?;
+    changed.push((job.clone(), AnalysisState::Waiting));
+    for dropped in queue.push(job) {
+        store.set_analysis_state(dropped.segment_id, None, AnalysisState::Skipped)?;
+        changed.push((dropped, AnalysisState::Skipped));
+    }
+    Ok(changed)
+}
+
+/// Allows one copy of the analysis models at a time. A new load waits until the models of the
+/// last load are free, so that a quick off and on does not load a second copy while a model
+/// call still runs.
+#[derive(Clone)]
+pub struct ModelGate {
+    sender: async_channel::Sender<()>,
+    receiver: async_channel::Receiver<()>,
+}
+
+/// The right to have the analysis models loaded. Drop gives it back.
+pub struct Permit(async_channel::Receiver<()>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.try_recv().ok();
+    }
+}
+
+impl Default for ModelGate {
+    fn default() -> Self {
+        let (sender, receiver) = async_channel::bounded(1);
+        Self { sender, receiver }
+    }
+}
+
+impl ModelGate {
+    /// Waits until no other permit exists.
+    pub async fn acquire(&self) -> Permit {
+        self.sender.send(()).await.ok();
+        Permit(self.receiver.clone())
+    }
+
+    /// A permit if no other permit exists.
+    #[cfg(test)]
+    pub fn try_acquire(&self) -> Option<Permit> {
+        self.sender
+            .try_send(())
+            .ok()
+            .map(|()| Permit(self.receiver.clone()))
     }
 }
 
@@ -325,11 +494,13 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
-    use super::{Analyzer, Job, JobQueue, text_hash};
+    use super::{Analyzer, Job, JobQueue, ModelGate, submit, text_hash};
     use crate::extract::{Page, PageSource};
     use crate::review::fake::{FakeLlm, FakeNli};
-    use crate::review::{Engines, ReviewError, ReviewEvent};
-    use crate::store::{Speaker, Store, SuggestionKind, SuggestionLevel};
+    use crate::review::{Engines, ReviewEvent};
+    use crate::store::{
+        AnalysisState, Speaker, Store, SuggestionKind, SuggestionLevel, SuggestionStatus,
+    };
 
     const QUESTION: &str = "¿Dónde estaba usted el 12 de marzo?";
     const ANSWER: &str = "Ese día yo estaba en Medellín.";
@@ -532,6 +703,22 @@ mod tests {
         assert_eq!(suggestions[0].level, SuggestionLevel::Check);
     }
 
+    fn analyzed(case: &Case, state: AnalysisState) -> ReviewEvent {
+        ReviewEvent::Analyzed {
+            hearing_id: case.hearing,
+            segment_id: case.answer,
+            state,
+        }
+    }
+
+    fn states(case: &Case) -> Vec<(i64, AnalysisState)> {
+        case.store
+            .lock()
+            .unwrap()
+            .analysis_states(case.hearing)
+            .unwrap()
+    }
+
     #[test]
     fn a_claim_without_a_flagged_passage_gives_nothing_and_no_explanation() {
         let case = seeded("neutral");
@@ -540,7 +727,7 @@ mod tests {
 
         let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
 
-        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(events, [analyzed(&case, AnalysisState::Complete)]);
         assert_eq!(llm.calls().len(), 1);
         assert!(
             case.store
@@ -583,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_error_is_reported() {
+    fn a_model_error_is_a_failed_analysis() {
         let case = seeded("error");
         let mut llm = llm("{}");
         llm.fail = true;
@@ -591,14 +778,160 @@ mod tests {
 
         let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
 
-        assert_eq!(
-            events,
-            [ReviewEvent::Error(ReviewError::Inference.message().into())]
-        );
+        assert_eq!(events, [analyzed(&case, AnalysisState::Failed)]);
+        assert_eq!(states(&case), [(case.answer, AnalysisState::Failed)]);
     }
 
     #[test]
-    fn an_error_after_a_stored_suggestion_reports_the_suggestion_and_the_error() {
+    fn claims_that_are_not_valid_json_are_a_failed_analysis_not_a_statement_without_claims() {
+        let case = seeded("malformed");
+        let llm = FakeLlm::new("[\"El acusado estaba en", "{}");
+        let mut analyzer = analyzer(&case, &llm, nli(0.95));
+
+        let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
+
+        assert_eq!(events, [analyzed(&case, AnalysisState::Failed)]);
+        assert_eq!(llm.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_claim_list_is_a_statement_without_claims() {
+        let case = seeded("no-claim");
+        let llm = FakeLlm::new("[]", "{}");
+        let mut analyzer = analyzer(&case, &llm, nli(0.95));
+
+        let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
+
+        assert_eq!(events, [analyzed(&case, AnalysisState::NoClaim)]);
+    }
+
+    #[test]
+    fn a_claim_with_no_passage_in_the_evidence_has_no_source() {
+        let case = seeded("no-source");
+        let llm = FakeLlm::new(
+            &serde_json::json!(["Compró una bicicleta azul."]).to_string(),
+            "{}",
+        );
+        let mut analyzer = analyzer(&case, &llm, nli(0.95));
+
+        let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
+
+        assert_eq!(events, [analyzed(&case, AnalysisState::NoSource)]);
+        assert_eq!(states(&case), [(case.answer, AnalysisState::NoSource)]);
+    }
+
+    #[test]
+    fn a_segment_without_analysis_is_skipped_and_a_queued_one_waits() {
+        let case = seeded("submit");
+        let job = job(&case, case.answer, ANSWER);
+
+        let off = submit(&case.store, None, job.clone()).unwrap();
+        assert_eq!(off, [(job.clone(), AnalysisState::Skipped)]);
+        assert_eq!(states(&case), [(case.answer, AnalysisState::Skipped)]);
+
+        let queue = JobQueue::new(4);
+        let on = submit(&case.store, Some(&queue), job.clone()).unwrap();
+        assert_eq!(on, [(job.clone(), AnalysisState::Waiting)]);
+        assert_eq!(queue.try_next(), Some(job));
+    }
+
+    #[test]
+    fn a_job_that_the_full_queue_drops_is_skipped() {
+        let case = seeded("overflow");
+        let queue = JobQueue::new(1);
+        let first = job(&case, case.question, QUESTION);
+        let second = job(&case, case.answer, ANSWER);
+        submit(&case.store, Some(&queue), first.clone()).unwrap();
+
+        let changed = submit(&case.store, Some(&queue), second.clone()).unwrap();
+
+        assert_eq!(
+            changed,
+            [
+                (second, AnalysisState::Waiting),
+                (first, AnalysisState::Skipped)
+            ]
+        );
+        assert_eq!(queue.dropped(), 1);
+    }
+
+    #[test]
+    fn a_refine_during_the_last_model_call_stores_no_new_suggestion() {
+        let case = seeded("refine-race");
+        let mut llm = llm(&explanation(true, "en Medellín", "estaba en Bogotá"));
+        let mut analyzer_1 = analyzer(&case, &llm, nli(0.95));
+        let old = added(&analyzer_1.analyze(&job(&case, case.answer, ANSWER)));
+        let store = case.store.clone();
+        let answer = case.answer;
+        // The refine pass changes the text while the language model explains the pair.
+        llm.on_explain = Some(Arc::new(move || {
+            store
+                .lock()
+                .unwrap()
+                .set_segment_text(answer, "Ese día yo estaba en Cali.")
+                .ok();
+        }));
+        let mut analyzer_2 = analyzer(&case, &llm, nli(0.95));
+
+        let events = analyzer_2.analyze(&job(&case, case.answer, ANSWER));
+
+        assert!(events.is_empty(), "{events:?}");
+        let stored = case
+            .store
+            .lock()
+            .unwrap()
+            .suggestions(case.hearing)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, old[0].id);
+        assert_eq!(stored[0].status, SuggestionStatus::Stale);
+        // The state of the old text does not apply to the new text.
+        assert!(states(&case).is_empty());
+    }
+
+    #[test]
+    fn a_failed_new_analysis_keeps_a_confirmed_suggestion() {
+        let case = seeded("keep-confirmed");
+        let mut llm = llm(&explanation(true, "en Medellín", "estaba en Bogotá"));
+        let first =
+            added(&analyzer(&case, &llm, nli(0.95)).analyze(&job(&case, case.answer, ANSWER)));
+        let refined = "Ese día yo estaba en Medellín, señor juez.";
+        {
+            let store = case.store.lock().unwrap();
+            store
+                .set_suggestion_status(first[0].id, SuggestionStatus::Confirmed)
+                .unwrap();
+            store.set_segment_text(case.answer, refined).unwrap();
+        }
+        llm.fail = true;
+
+        let events = analyzer(&case, &llm, nli(0.95)).analyze(&job(&case, case.answer, refined));
+
+        assert_eq!(events, [analyzed(&case, AnalysisState::Failed)]);
+        let stored = case
+            .store
+            .lock()
+            .unwrap()
+            .suggestions(case.hearing)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, SuggestionStatus::Confirmed);
+        assert_eq!(stored[0].segment_revision, 0);
+    }
+
+    #[test]
+    fn the_model_gate_gives_one_permit_at_a_time() {
+        let gate = ModelGate::default();
+
+        let first = gate.try_acquire().expect("free gate");
+        assert!(gate.try_acquire().is_none());
+        drop(first);
+
+        assert!(gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn an_error_after_a_flagged_pair_stores_nothing_and_fails() {
         let case = seeded("partial-error");
         let mut llm = FakeLlm::new(
             &serde_json::json!([CLAIM, CLAIM]).to_string(),
@@ -609,20 +942,15 @@ mod tests {
 
         let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
 
-        let stored = case
-            .store
-            .lock()
-            .unwrap()
-            .suggestions(case.hearing)
-            .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(
-            events,
-            [
-                ReviewEvent::SuggestionAdded(stored[0].clone()),
-                ReviewEvent::Error(ReviewError::Inference.message().into()),
-            ]
+        assert!(
+            case.store
+                .lock()
+                .unwrap()
+                .suggestions(case.hearing)
+                .unwrap()
+                .is_empty()
         );
+        assert_eq!(events, [analyzed(&case, AnalysisState::Failed)]);
     }
 
     #[test]
@@ -634,16 +962,16 @@ mod tests {
 
         let events = analyzer.analyze(&job(&case, case.answer, ANSWER));
 
-        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(events, [analyzed(&case, AnalysisState::Skipped)]);
         assert!(llm.calls().is_empty());
     }
 
     #[test]
-    fn a_new_analysis_of_a_segment_replaces_its_old_suggestions() {
+    fn a_new_analysis_after_a_refine_adds_suggestions_and_the_old_ones_stay_stale() {
         let case = seeded("replace");
         let llm = llm(&explanation(true, "en Medellín", "estaba en Bogotá"));
         let mut analyzer = analyzer(&case, &llm, nli(0.95));
-        analyzer.analyze(&job(&case, case.answer, ANSWER));
+        let old = added(&analyzer.analyze(&job(&case, case.answer, ANSWER)));
         let refined = "Ese día yo estaba en Medellín, señor juez.";
         case.store
             .lock()
@@ -659,14 +987,19 @@ mod tests {
             .unwrap()
             .suggestions(case.hearing)
             .unwrap();
-        assert_eq!(stored.len(), 1);
+        assert_eq!(stored.len(), 2);
+        let new = stored.iter().find(|s| s.id != old[0].id).unwrap();
+        assert_eq!(
+            (new.status, new.segment_revision),
+            (SuggestionStatus::Open, 1)
+        );
+        let stale = stored.iter().find(|s| s.id == old[0].id).unwrap();
+        assert_eq!(stale.status, SuggestionStatus::Stale);
         assert_eq!(
             events,
             [
-                ReviewEvent::SuggestionsRemoved {
-                    hearing_id: case.hearing
-                },
-                ReviewEvent::SuggestionAdded(stored[0].clone()),
+                ReviewEvent::SuggestionAdded(new.clone()),
+                analyzed(&case, AnalysisState::Complete),
             ]
         );
     }

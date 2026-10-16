@@ -1,6 +1,7 @@
 //! Fake language and NLI models for tests.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{Engines, Llm, Nli, NliScores, ReviewBackend, ReviewError};
@@ -14,7 +15,21 @@ pub struct FakeLlm {
     pub fail: bool,
     /// The explanation call with this index (from 0), and each call after it, fails.
     pub fail_explain_from: Option<usize>,
+    /// Runs during each explanation call, for example to change the store while the model
+    /// works.
+    pub on_explain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub calls: Arc<Mutex<Vec<String>>>,
+    /// Held by the models of one load, so that the backend counts the loaded copies.
+    loaded: Option<Arc<Loaded>>,
+}
+
+/// One loaded copy of the fake models. Drop counts it as free.
+struct Loaded(Arc<AtomicUsize>);
+
+impl Drop for Loaded {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeLlm {
@@ -24,7 +39,9 @@ impl FakeLlm {
             explanation: explanation.to_owned(),
             fail: false,
             fail_explain_from: None,
+            on_explain: None,
             calls: Arc::default(),
+            loaded: None,
         }
     }
 
@@ -52,6 +69,10 @@ impl Llm for FakeLlm {
             .filter(|call| call.starts_with("explain|"))
             .count();
         calls.push(format!("explain|{claim}|{passage}"));
+        drop(calls);
+        if let Some(on_explain) = &self.on_explain {
+            on_explain();
+        }
         if self.fail_explain_from.is_some_and(|from| index >= from) {
             return Err(ReviewError::Inference);
         }
@@ -98,6 +119,11 @@ pub struct FakeReviewBackend {
     /// When true, the load fails as with damaged model files.
     pub fail: bool,
     pub loaded: Arc<Mutex<Option<LoadedFiles>>>,
+    /// The number of loads.
+    pub loads: Arc<AtomicUsize>,
+    /// The number of loaded copies now, and the largest number at one time.
+    pub copies: Arc<AtomicUsize>,
+    pub max_copies: Arc<AtomicUsize>,
 }
 
 impl FakeReviewBackend {
@@ -107,6 +133,9 @@ impl FakeReviewBackend {
             nli,
             fail: false,
             loaded: Arc::default(),
+            loads: Arc::default(),
+            copies: Arc::default(),
+            max_copies: Arc::default(),
         }
     }
 }
@@ -114,11 +143,16 @@ impl FakeReviewBackend {
 impl ReviewBackend for FakeReviewBackend {
     fn load(&self, nli: &[PathBuf], llm: &[PathBuf]) -> Result<Engines, ReviewError> {
         *self.loaded.lock().unwrap() = Some((nli.to_vec(), llm.to_vec()));
+        self.loads.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err(ReviewError::ModelLoad);
         }
+        let copies = self.copies.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_copies.fetch_max(copies, Ordering::SeqCst);
+        let mut llm = self.llm.clone();
+        llm.loaded = Some(Arc::new(Loaded(self.copies.clone())));
         Ok(Engines {
-            llm: Box::new(self.llm.clone()),
+            llm: Box::new(llm),
             nli: Box::new(self.nli.clone()),
         })
     }

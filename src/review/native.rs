@@ -410,7 +410,11 @@ mod tests {
             )
             .unwrap();
         println!("claims ({:?}): {claims}", started.elapsed());
-        let claim = parse_claims(&claims).into_iter().next().expect("no claim");
+        let claim = parse_claims(&claims)
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("no claim");
 
         let chunk = "Según el registro del hotel, el 12 de marzo el acusado viajó a Medellín \
                      y no estuvo en Bogotá.";

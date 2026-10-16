@@ -12,21 +12,18 @@ pub const MAX_CLAIMS: usize = 5;
 pub const MAX_PAIR_WORDS: usize = 300;
 
 /// The claims in the output of the language model: the strings of the first JSON array,
-/// trimmed, without empty strings, at most [`MAX_CLAIMS`]. Output that is not an array of
-/// strings gives no claims.
-pub fn parse_claims(text: &str) -> Vec<String> {
-    let Some(json) = between(text, '[', ']') else {
-        return Vec::new();
-    };
-    let Ok(claims) = serde_json::from_str::<Vec<String>>(json) else {
-        return Vec::new();
-    };
-    claims
-        .into_iter()
-        .map(|claim| claim.trim().to_owned())
-        .filter(|claim| !claim.is_empty())
-        .take(MAX_CLAIMS)
-        .collect()
+/// trimmed, without empty strings, at most [`MAX_CLAIMS`]. Returns `None` for output that is
+/// not an array of strings, so that a failed extraction is not taken as "no claim".
+pub fn parse_claims(text: &str) -> Option<Vec<String>> {
+    let claims: Vec<String> = serde_json::from_str(between(text, '[', ']')?).ok()?;
+    Some(
+        claims
+            .into_iter()
+            .map(|claim| claim.trim().to_owned())
+            .filter(|claim| !claim.is_empty())
+            .take(MAX_CLAIMS)
+            .collect(),
+    )
 }
 
 /// The explanation of a flagged pair, after validation.
@@ -151,7 +148,7 @@ mod tests {
     fn claims_are_the_strings_of_the_array_trimmed_and_at_most_five() {
         let text = r#"["  El acusado estaba en Medellín.  ", "", "Pagó 1.500.000 pesos.", "c3", "c4", "c5", "c6"]"#;
 
-        let claims = parse_claims(text);
+        let claims = parse_claims(text).unwrap();
 
         assert_eq!(claims.len(), MAX_CLAIMS);
         assert_eq!(claims[0], "El acusado estaba en Medellín.");
@@ -160,10 +157,16 @@ mod tests {
 
     #[test]
     fn claims_are_found_in_text_around_the_array_and_bad_json_gives_none() {
-        assert_eq!(parse_claims("Claro: [\"Uno.\"] fin"), ["Uno."]);
-        assert!(parse_claims("[\"sin cierre").is_empty());
-        assert!(parse_claims("{\"a\": 1}").is_empty());
-        assert!(parse_claims("[1, 2]").is_empty());
+        assert_eq!(parse_claims("Claro: [\"Uno.\"] fin").unwrap(), ["Uno."]);
+        assert_eq!(parse_claims("[\"sin cierre"), None);
+        assert_eq!(parse_claims("{\"a\": 1}"), None);
+        assert_eq!(parse_claims("[1, 2]"), None);
+    }
+
+    #[test]
+    fn an_empty_array_is_no_claim_and_not_a_failure() {
+        assert_eq!(parse_claims("[]"), Some(Vec::new()));
+        assert_eq!(parse_claims("[\"  \"]"), Some(Vec::new()));
     }
 
     fn json(contradiction: bool, kind: &str, quote_claim: &str, quote_evidence: &str) -> String {

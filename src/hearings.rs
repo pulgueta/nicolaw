@@ -4,6 +4,7 @@
 //! window and the quit can complete it.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,10 +37,10 @@ use crate::models::{
     self, ANALYSIS_MODELS, AnalysisModel, CATALOG, COHERE, CatalogModel, ModelDirs, ModelStatus,
     NEMOTRON, SILERO_VAD,
 };
-use crate::review::analyzer::{self, Analyzer, Job, JobQueue, text_hash};
-use crate::review::{ReviewBackend, ReviewEvent};
+use crate::review::analyzer::{self, Analyzer, Job, JobQueue, ModelGate, text_hash};
+use crate::review::{ReviewBackend, ReviewError, ReviewEvent};
 use crate::store::{
-    Hearing, Segment, Speaker, Store, Suggestion, SuggestionCounts, SuggestionKind,
+    AnalysisState, Hearing, Segment, Speaker, Store, Suggestion, SuggestionCounts, SuggestionKind,
     SuggestionLevel, SuggestionStatus,
 };
 
@@ -87,6 +88,10 @@ const MICROPHONE_SETTING: &str = "microphone";
 /// The value of "Micrófono del sistema" in the microphone select.
 const SYSTEM_MICROPHONE: &str = "";
 const SUGGESTION_ERROR: &str = "Nicolaw no puede guardar la decisión. Intente de nuevo.";
+const STALE_TEXT: &str = "La transcripción cambió. Esta sugerencia requiere otra revisión.";
+const STALE_SPEAKER: &str = "Hablante corregido. Nicolaw actualizará las sugerencias.";
+/// A quiet panel does not mean that the statements agree with the evidence.
+const NO_OPEN_SUGGESTIONS: &str = "No hay sugerencias abiertas. Esto no confirma la declaración.";
 /// The analysis queue keeps at most this number of segments. When it is full, a new segment
 /// replaces the oldest one, so that the analysis never slows the transcription.
 const REVIEW_QUEUE: usize = 32;
@@ -1137,7 +1142,8 @@ enum Filter {
 impl Filter {
     fn matches(self, status: SuggestionStatus) -> bool {
         match self {
-            Self::Open => status == SuggestionStatus::Open,
+            // A stale suggestion needs a new review, so it stays in the open list.
+            Self::Open => matches!(status, SuggestionStatus::Open | SuggestionStatus::Stale),
             Self::Confirmed => status == SuggestionStatus::Confirmed,
             Self::Dismissed => status == SuggestionStatus::Dismissed,
             Self::All => true,
@@ -1251,9 +1257,13 @@ pub struct HearingsView {
     /// The segments that wait for analysis, and the segments that the full queue dropped.
     review_pending: usize,
     review_dropped: u64,
+    /// Allows one copy of the analysis models at a time.
+    model_gate: ModelGate,
     /// The suggestions of the selected hearing: open first, then newest first.
     suggestions: Vec<Suggestion>,
     counts: SuggestionCounts,
+    /// The analysis state of each segment of the accused in the selected hearing.
+    analysis_states: HashMap<i64, AnalysisState>,
     filter_select: Entity<SelectState<Vec<FilterItem>>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -1328,8 +1338,10 @@ impl HearingsView {
             review: None,
             review_pending: 0,
             review_dropped: 0,
+            model_gate: ModelGate::default(),
             suggestions: Vec::new(),
             counts: SuggestionCounts::default(),
+            analysis_states: HashMap::new(),
             filter_select,
             _subscriptions: subscriptions,
         };
@@ -1390,6 +1402,7 @@ impl HearingsView {
         self.new_text = false;
         self.suggestions.clear();
         self.counts = SuggestionCounts::default();
+        self.analysis_states.clear();
     }
 
     fn on_recording(&mut self, event: RecordingEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1411,6 +1424,7 @@ impl HearingsView {
                 if result.is_err() {
                     self.message = Some(SAVE_ERROR.into());
                 }
+                self.stop_review_when_idle(cx);
                 if self.selected == Some(hearing_id) {
                     self.set_filter(Filter::All, window, cx);
                 }
@@ -1599,7 +1613,10 @@ impl HearingsView {
         let store = self.store.clone();
         cx.spawn_in(window, async move |this, cx| {
             let segments = cx
-                .background_spawn(async move { store.lock().unwrap().segments(id) })
+                .background_spawn(async move {
+                    let store = store.lock().unwrap();
+                    Ok::<_, rusqlite::Error>((store.segments(id)?, store.analysis_states(id)?))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.selected != Some(id) {
@@ -1607,7 +1624,11 @@ impl HearingsView {
                 }
                 match segments {
                     // A segment that is still open shows as the partial row, not in the list.
-                    Ok(segments) => {
+                    Ok((segments, states)) => {
+                        // A state that changed while the list loaded is already in the view.
+                        for (segment, state) in states {
+                            this.analysis_states.entry(segment).or_insert(state);
+                        }
                         let open = this.partial.as_ref().map(|partial| partial.segment_id);
                         let mut loaded: Vec<Segment> = segments
                             .into_iter()
@@ -1825,6 +1846,9 @@ impl HearingsView {
             }
             Event::Refined { segment_id, text } => {
                 self.enqueue(case_id, hearing_id, *segment_id, text)
+            }
+            Event::SpeakerChanged { segment_id } => {
+                self.speaker_changed(case_id, hearing_id, *segment_id, cx)
             }
             _ => {}
         }
@@ -2179,10 +2203,18 @@ impl HearingsView {
         self.live_analysis && self.analysis_files().is_some()
     }
 
-    /// Starts the analysis, if it is on and does not run. The models load in the background;
-    /// the queue keeps the segments until they are ready.
+    /// Starts the analysis, if the switch is on and it does not run.
     fn start_review(&mut self, cx: &mut Context<Self>) {
-        if !self.live_analysis || self.review.is_some() || self.analysis_models.is_none() {
+        if self.live_analysis {
+            self.run_review(cx);
+        }
+    }
+
+    /// Starts the analysis if it does not run, also with the switch off (for Reintentar). The
+    /// models load in the background; the queue keeps the segments until they are ready. A
+    /// new load waits until the models of the last load are free.
+    fn run_review(&mut self, cx: &mut Context<Self>) {
+        if self.review.is_some() {
             return;
         }
         let Some((nli, llm)) = self.analysis_files() else {
@@ -2195,12 +2227,15 @@ impl HearingsView {
             cancel: Arc::default(),
         });
         let backend = self.env.review.clone();
+        let gate = self.model_gate.clone();
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
+                    let permit = gate.acquire().await;
                     // The files can be gone since the last look.
                     let present = nli.iter().chain(&llm).all(|path| path.is_file());
-                    present.then(|| backend.load(&nli, &llm))
+                    // The models go before the permit when the pair is dropped.
+                    present.then(|| backend.load(&nli, &llm).map(|engines| (engines, permit)))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -2217,10 +2252,11 @@ impl HearingsView {
                         this.review = None;
                         this.apply_review(ReviewEvent::ModelsMissing, cx);
                     }
-                    Some(Ok(engines)) => {
+                    Some(Ok((engines, permit))) => {
                         let (events, receiver) = async_channel::unbounded();
                         let analyzer = Analyzer::new(this.store.clone(), engines)
-                            .with_cancel(review.cancel.clone());
+                            .with_cancel(review.cancel.clone())
+                            .with_permit(permit);
                         review.task =
                             Some(cx.background_spawn(analyzer::run(analyzer, queue, events)));
                         this.listen_review(receiver, cx);
@@ -2239,13 +2275,36 @@ impl HearingsView {
         .detach();
     }
 
-    /// Stops the analysis. The segments in the queue are not analyzed.
+    /// Stops the analysis and frees its models. The segments in the queue are not analyzed:
+    /// they are `skipped`.
     fn stop_review(&mut self) {
         if let Some(review) = self.review.take() {
             review.queue.close();
             review.cancel.store(true, Ordering::Relaxed);
+            let store = self.store.lock().unwrap();
+            for job in review.queue.drain() {
+                if store
+                    .set_analysis_state(job.segment_id, None, AnalysisState::Skipped)
+                    .is_ok()
+                    && self.selected == Some(job.hearing_id)
+                {
+                    self.analysis_states
+                        .insert(job.segment_id, AnalysisState::Skipped);
+                }
+            }
         }
         self.review_pending = 0;
+    }
+
+    /// Stops the analysis when no recording runs and no segment waits, so that the models are
+    /// free between hearings.
+    fn stop_review_when_idle(&mut self, cx: &App) {
+        let idle = self.review.as_ref().is_some_and(|review| {
+            review.queue.pending() == 0 && (review.task.is_none() || self.review_pending == 0)
+        });
+        if idle && self.recording.read(cx).live().is_none() {
+            self.stop_review();
+        }
     }
 
     fn listen_review(
@@ -2266,14 +2325,90 @@ impl HearingsView {
         .detach();
     }
 
+    /// Puts the segment into the analysis queue, or marks it `skipped` when no analysis runs.
     fn enqueue(&mut self, case_id: i64, hearing_id: i64, segment_id: i64, text: &str) {
-        if let Some(review) = &self.review {
-            review.queue.push(Job {
-                case_id,
-                hearing_id,
-                segment_id,
-                text_hash: text_hash(text),
-            });
+        let job = Job {
+            case_id,
+            hearing_id,
+            segment_id,
+            text_hash: text_hash(text),
+        };
+        let queue = self.review.as_ref().map(|review| &review.queue);
+        match analyzer::submit(&self.store, queue, job) {
+            Ok(changed) => {
+                for (job, state) in changed {
+                    if self.selected == Some(job.hearing_id) {
+                        self.analysis_states.insert(job.segment_id, state);
+                    }
+                }
+            }
+            Err(_) => self.message = Some(ReviewError::Storage.message().into()),
+        }
+    }
+
+    /// Analyzes the segment again, after the hearing. The models load for it and are free
+    /// again after it.
+    fn retry_analysis(&mut self, segment_id: i64, cx: &mut Context<Self>) {
+        let (Some(hearing_id), Some(case_id)) = (self.selected, self.case_id) else {
+            return;
+        };
+        let Some(text) = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .map(|segment| segment.text.clone())
+        else {
+            return;
+        };
+        self.run_review(cx);
+        self.enqueue(case_id, hearing_id, segment_id, &text);
+        cx.notify();
+    }
+
+    /// A corrected speaker changes the analysis of the segment. Other → Accused: the segment
+    /// waits for analysis. Accused → Other: its open suggestions become stale.
+    fn speaker_changed(
+        &mut self,
+        case_id: i64,
+        hearing_id: i64,
+        segment_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .cloned()
+        else {
+            return;
+        };
+        match segment.speaker {
+            Speaker::Accused => {
+                if segment.failed {
+                    return;
+                }
+                self.start_review(cx);
+                self.enqueue(case_id, hearing_id, segment_id, &segment.text);
+            }
+            Speaker::Other => {
+                self.analysis_states.remove(&segment_id);
+                let store = self.store.clone();
+                cx.spawn(async move |this, cx| {
+                    let marked = cx
+                        .background_spawn(
+                            async move { store.lock().unwrap().mark_stale(segment_id) },
+                        )
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if marked.is_err() {
+                            this.message = Some(SUGGESTION_ERROR.into());
+                        }
+                        this.load_suggestions(hearing_id, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
         }
     }
 
@@ -2284,14 +2419,23 @@ impl HearingsView {
                     self.load_suggestions(suggestion.hearing_id, cx);
                 }
             }
-            ReviewEvent::SuggestionsRemoved { hearing_id } => {
+            ReviewEvent::Analyzed {
+                hearing_id,
+                segment_id,
+                state,
+            } => {
                 if self.selected == Some(hearing_id) {
+                    self.analysis_states.insert(segment_id, state);
+                    // Earlier suggestions of the segment can be stale now.
                     self.load_suggestions(hearing_id, cx);
                 }
             }
             ReviewEvent::Progress { pending, dropped } => {
                 self.review_pending = pending;
                 self.review_dropped = dropped;
+                if pending == 0 {
+                    self.stop_review_when_idle(cx);
+                }
             }
             // The files are gone: look again, so that the panel offers the downloads.
             ReviewEvent::ModelsMissing => self.load_analysis_models(cx),
@@ -2951,10 +3095,15 @@ impl HearingsView {
                 segment.speaker,
                 None,
                 text,
-                toggle,
+                toggle
+                    .map(IntoElement::into_any_element)
+                    .into_iter()
+                    .chain(self.render_analysis_state(segment, cx))
+                    .collect(),
                 muted,
             )
         });
+        let rows: Vec<AnyElement> = rows.collect();
         let partial = self.partial.as_ref().map(|partial| {
             let text = format!("{}{}", partial.committed, partial.tentative);
             let tentative = partial.committed.len()..text.len();
@@ -2972,7 +3121,7 @@ impl HearingsView {
                             ..Default::default()
                         },
                     )])),
-                None,
+                Vec::new(),
                 muted,
             )
         });
@@ -3026,8 +3175,8 @@ impl HearingsView {
             .map(|suggestion| self.render_card(suggestion, cx))
             .collect();
         let empty = cards.is_empty().then(|| {
-            let text = if self.suggestions.is_empty() {
-                "No hay sugerencias. Nicolaw analiza las declaraciones del acusado cuando terminan."
+            let text = if self.suggestions.is_empty() || filter == Filter::Open {
+                NO_OPEN_SUGGESTIONS
             } else {
                 "No hay sugerencias con este filtro."
             };
@@ -3192,7 +3341,16 @@ impl HearingsView {
             SuggestionStatus::Open => None,
             SuggestionStatus::Confirmed => Some(Tag::success().small().child("Confirmada")),
             SuggestionStatus::Dismissed => Some(Tag::secondary().small().child("Descartada")),
+            SuggestionStatus::Stale => Some(Tag::secondary().small().child("Desactualizada")),
         };
+        let stale = (suggestion.status == SuggestionStatus::Stale).then(|| {
+            div()
+                .id(("stale-note", id as u64))
+                .text_xs()
+                .text_color(muted)
+                .child(self.stale_note(suggestion))
+                .test_support()
+        });
         let quote = suggestion.claim_quote.as_deref().and_then(|quote| {
             let start = suggestion.claim.find(quote)?;
             Some(start..start + quote.len())
@@ -3236,6 +3394,7 @@ impl HearingsView {
                     )
                     .children(status),
             )
+            .children(stale)
             .child(label("Declaración"))
             .child(div().text_sm().child(claim))
             .child(label("Prueba"))
@@ -3292,8 +3451,93 @@ impl HearingsView {
                         ),
                 )
             })
+            // A stale suggestion is about an earlier text or speaker: it can only be dismissed.
+            .when(suggestion.status == SuggestionStatus::Stale, |card| {
+                card.child(
+                    Button::new(("dismiss", id as u64))
+                        .ghost()
+                        .small()
+                        .label("Descartar")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_suggestion_status(id, SuggestionStatus::Dismissed, cx)
+                        })),
+                )
+            })
             .test_support()
             .into_any_element()
+    }
+
+    /// Why a suggestion is stale: the text changed after the analysis, or the speaker.
+    fn stale_note(&self, suggestion: &Suggestion) -> &'static str {
+        let text_changed = self
+            .segments
+            .iter()
+            .find(|segment| segment.id == suggestion.segment_id)
+            .is_some_and(|segment| segment.revision > suggestion.segment_revision);
+        if text_changed {
+            STALE_TEXT
+        } else {
+            STALE_SPEAKER
+        }
+    }
+
+    /// The analysis state of a statement of the accused, as a quiet tag, with Reintentar
+    /// after the hearing when the statement was not analyzed.
+    fn render_analysis_state(
+        &self,
+        segment: &Segment,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if segment.speaker != Speaker::Accused || segment.failed {
+            return None;
+        }
+        let id = segment.id;
+        let mut state = *self.analysis_states.get(&id)?;
+        let live = self.recording.read(cx).live_hearing() == self.selected;
+        // A segment that waits when no analysis runs is not analyzed, for example after a
+        // restart of the app.
+        if state == AnalysisState::Waiting && self.review.is_none() {
+            state = AnalysisState::Skipped;
+        }
+        let retry = (matches!(state, AnalysisState::Skipped | AnalysisState::Failed)
+            && !live
+            && self.analysis_files().is_some())
+        .then(|| {
+            Button::new(("retry-analysis", id as u64))
+                .ghost()
+                .xsmall()
+                .label("Reintentar")
+                .on_click(cx.listener(move |this, _, _, cx| this.retry_analysis(id, cx)))
+        });
+        let tag = if state == AnalysisState::Failed {
+            Tag::warning()
+        } else {
+            Tag::secondary()
+        };
+        Some(
+            h_flex()
+                .id(("analysis-state", id as u64))
+                .gap_1()
+                .items_center()
+                .child(tag.small().child(analysis_label(state)))
+                .children(retry)
+                .test_support()
+                .into_any_element(),
+        )
+    }
+}
+
+/// The text of an analysis state, for the transcript.
+pub fn analysis_label(state: AnalysisState) -> &'static str {
+    match state {
+        AnalysisState::Waiting => "Análisis pendiente",
+        AnalysisState::Complete => "Analizado",
+        AnalysisState::NoClaim => "Sin afirmaciones verificables",
+        AnalysisState::NoSource => {
+            "No se encontró un pasaje para comparar. Esto no confirma la declaración."
+        }
+        AnalysisState::Failed => "Análisis fallido",
+        AnalysisState::Skipped => "Esta declaración no se analizó.",
     }
 }
 
@@ -3308,7 +3552,8 @@ pub fn kind_label(kind: SuggestionKind) -> &'static str {
     }
 }
 
-/// One transcript item: a small row with the time, the speaker, and the correction action,
+/// One transcript item: a small row with the time, the speaker, a note, and the actions (the
+/// correction of the speaker and the analysis state),
 /// then the statement at full width.
 fn render_row(
     id: impl Into<ElementId>,
@@ -3316,7 +3561,7 @@ fn render_row(
     speaker: Speaker,
     note: Option<&'static str>,
     text: Div,
-    toggle: Option<Button>,
+    actions: Vec<AnyElement>,
     muted: Hsla,
 ) -> AnyElement {
     let tag = match speaker {
@@ -3328,14 +3573,15 @@ fn render_row(
         .gap_1()
         .child(
             h_flex()
+                .flex_wrap()
                 .gap_2()
                 .items_center()
                 .text_xs()
                 .text_color(muted)
                 .child(format_time(t_start_ms))
                 .child(tag.small().child(speaker_label(speaker)))
-                .children(toggle)
-                .children(note),
+                .children(note)
+                .children(actions),
         )
         .child(text.w_full())
         .test_support()
@@ -3402,7 +3648,8 @@ mod tests {
     use crate::review::ReviewEvent;
     use crate::review::fake::{FakeLlm, FakeNli, FakeReviewBackend};
     use crate::store::{
-        NewSuggestion, Segment, Speaker, Store, SuggestionCounts, SuggestionLevel, SuggestionStatus,
+        AnalysisState, NewSuggestion, Segment, Speaker, Store, SuggestionCounts, SuggestionLevel,
+        SuggestionStatus,
     };
 
     const WAIT: Duration = Duration::from_secs(1);
@@ -4171,6 +4418,7 @@ mod tests {
             level,
             nli_contradiction: 0.95,
             explanation: Some("El registro ubica al acusado en Bogotá.".into()),
+            segment_revision: 0,
         }
     }
 
@@ -4456,6 +4704,242 @@ mod tests {
 
         assert!(cancel.load(Ordering::Relaxed));
         cx.update(|cx| assert!(view.read(cx).review.is_none()));
+    }
+
+    fn conflict_llm() -> FakeLlm {
+        let explanation = serde_json::json!({
+            "contradiction": true,
+            "kind": "location",
+            "explanation_es": "El registro ubica al acusado en Bogotá.",
+            "quote_claim": "en Medellín",
+            "quote_evidence": "estaba en Bogotá",
+        });
+        FakeLlm::new(
+            &serde_json::json!([CLAIM]).to_string(),
+            &explanation.to_string(),
+        )
+    }
+
+    /// Opens a view with installed analysis models and the hotel register in the case, and
+    /// selects the hearing.
+    async fn open_hearing_with_analysis(
+        name: &str,
+        store: Store,
+        case: i64,
+        hearing: i64,
+        review: &FakeReviewBackend,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<HearingsView>) {
+        add_evidence(&store, case, name);
+        let dirs = model_dirs(name, true);
+        install_analysis_models(&dirs);
+        let (window, view) = open_with(name, store, case, &FakeBackend::new(""), review, &dirs, cx);
+        select_hearing(cx, window, hearing).await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).analysis_on())
+            .await;
+        (window, view)
+    }
+
+    fn state_of(
+        view: &Entity<HearingsView>,
+        segment: i64,
+        cx: &TestAppContext,
+    ) -> Option<AnalysisState> {
+        cx.read(|cx| view.read(cx).analysis_states.get(&segment).copied())
+    }
+
+    #[gpui_kit::test]
+    async fn reintentar_analyzes_a_skipped_statement_and_frees_the_models(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, segment) = add_hearing(&store, case);
+        store
+            .set_analysis_state(segment, None, AnalysisState::Skipped)
+            .unwrap();
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+        let (window, view) =
+            open_hearing_with_analysis("retry", store, case, hearing, &review, cx).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window
+                .try_find(("retry-analysis", segment as u64))
+                .is_some()
+        })
+        .await;
+        assert!(shown(cx, window, ("analysis-state", segment as u64)));
+        assert_eq!(state_of(&view, segment, cx), Some(AnalysisState::Skipped));
+
+        click(cx, window, ("retry-analysis", segment as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx).analysis_states.get(&segment) == Some(&AnalysisState::Complete)
+        })
+        .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).suggestions.len() == 1)
+            .await;
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).review.is_none())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(review.loads.load(Ordering::SeqCst), 1);
+        assert_eq!(review.copies.load(Ordering::SeqCst), 0);
+        assert!(!shown(cx, window, ("retry-analysis", segment as u64)));
+    }
+
+    #[gpui_kit::test]
+    async fn a_failed_analysis_and_a_missing_source_show_distinct_states(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let (hearing, failed) = add_hearing(&store, case);
+        let no_source = store
+            .insert_segment(hearing, 5_000, Speaker::Accused)
+            .unwrap();
+        store
+            .finish_segment(no_source, "Tengo una bicicleta.", 6_000)
+            .unwrap();
+        store
+            .set_analysis_state(failed, None, AnalysisState::Failed)
+            .unwrap();
+        store
+            .set_analysis_state(no_source, None, AnalysisState::NoSource)
+            .unwrap();
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+
+        let (window, view) =
+            open_hearing_with_analysis("states", store, case, hearing, &review, cx).await;
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window
+                .try_find(("analysis-state", no_source as u64))
+                .is_some()
+        })
+        .await;
+        assert_eq!(state_of(&view, failed, cx), Some(AnalysisState::Failed));
+        assert_eq!(
+            state_of(&view, no_source, cx),
+            Some(AnalysisState::NoSource)
+        );
+        // A failed analysis can run again; a missing source is a complete check.
+        assert!(shown(cx, window, ("retry-analysis", failed as u64)));
+        assert!(!shown(cx, window, ("retry-analysis", no_source as u64)));
+        assert_ne!(
+            super::analysis_label(AnalysisState::NoSource),
+            super::analysis_label(AnalysisState::Complete)
+        );
+        assert!(
+            super::analysis_label(AnalysisState::NoSource).contains("no confirma"),
+            "a missing source is not agreement"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn a_statement_corrected_to_the_accused_is_analyzed(cx: &mut TestAppContext) {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let segment = store
+            .insert_segment(hearing, 1_000, Speaker::Other)
+            .unwrap();
+        store.finish_segment(segment, ANSWER, 3_000).unwrap();
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+        let (window, view) =
+            open_hearing_with_analysis("speaker-accused", store, case, hearing, &review, cx).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window
+                .try_find(("toggle-speaker", segment as u64))
+                .is_some()
+        })
+        .await;
+        assert!(cx.read(|cx| view.read(cx).suggestions.is_empty()));
+
+        click(cx, window, ("toggle-speaker", segment as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).suggestions.len() == 1)
+            .await;
+        assert_eq!(state_of(&view, segment, cx), Some(AnalysisState::Complete));
+        // No recording runs: the models are free after the analysis.
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).review.is_none())
+            .await;
+    }
+
+    #[gpui_kit::test]
+    async fn a_statement_corrected_to_an_other_speaker_makes_its_suggestions_stale(
+        cx: &mut TestAppContext,
+    ) {
+        let (store, case) = store_with_case();
+        let chunk = add_evidence(&store, case, "speaker-other-chunk");
+        let (hearing, segment) = add_hearing(&store, case);
+        let id = store
+            .insert_suggestion(&new_suggestion(
+                hearing,
+                segment,
+                chunk,
+                SuggestionLevel::Conflict,
+            ))
+            .unwrap()
+            .id as u64;
+        let review = FakeReviewBackend::new(conflict_llm(), nli());
+        let (window, view) =
+            open_hearing_with_analysis("speaker-other", store, case, hearing, &review, cx).await;
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("confirm", id)).is_some()
+        })
+        .await;
+
+        click(cx, window, ("toggle-speaker", segment as u64));
+
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .suggestions
+                .first()
+                .is_some_and(|s| s.status == SuggestionStatus::Stale)
+        })
+        .await;
+        cx.run_until_parked();
+        assert!(shown(cx, window, ("stale-note", id)));
+        assert!(!shown(cx, window, ("confirm", id)));
+        assert!(shown(cx, window, ("dismiss", id)));
+        cx.read(|cx| assert_eq!(view.read(cx).counts, SuggestionCounts::default()));
+        assert_eq!(review.loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn finalizar_frees_the_analysis_models(cx: &mut TestAppContext) {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        let (window, view, _) = record_with_analysis("finish-unload", &review, cx).await;
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.task.is_some())
+        })
+        .await;
+        assert_eq!(review.copies.load(Ordering::SeqCst), 1);
+
+        click(cx, window, "finish");
+
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).review.is_none())
+            .await;
+        cx.run_until_parked();
+        assert_eq!(review.copies.load(Ordering::SeqCst), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn a_quick_off_and_on_never_loads_a_second_copy(cx: &mut TestAppContext) {
+        let review = FakeReviewBackend::new(FakeLlm::new("[]", "{}"), nli());
+        let (window, view, _) = record_with_analysis("off-on", &review, cx).await;
+
+        click(cx, window, "live-analysis");
+        click(cx, window, "live-analysis");
+        click(cx, window, "live-analysis");
+        click(cx, window, "live-analysis");
+
+        cx.wait_for(window, WAIT, |_, cx| {
+            view.read(cx)
+                .review
+                .as_ref()
+                .is_some_and(|review| review.task.is_some())
+        })
+        .await;
+        cx.run_until_parked();
+        assert!(review.loads.load(Ordering::SeqCst) >= 2);
+        assert_eq!(review.max_copies.load(Ordering::SeqCst), 1);
+        assert_eq!(review.copies.load(Ordering::SeqCst), 1);
     }
 
     #[gpui_kit::test]

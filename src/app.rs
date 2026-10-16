@@ -37,7 +37,7 @@ use gpui_kit::*;
 
 use crate::analysis;
 use crate::extract::{Page, PageSource};
-use crate::hearings::{HearingsEnv, HearingsView};
+use crate::hearings::{self, HearingsEnv, HearingsView, Recording};
 use crate::preview::{self, Preview};
 use crate::store::{
     AnalysisStatus, Case, Evidence, ImportError, SearchGroup, SearchHit, Store, file_name,
@@ -116,6 +116,8 @@ pub struct FilesView {
     case_select: Entity<SelectState<Vec<CaseItem>>>,
     screen: Screen,
     hearings: Entity<HearingsView>,
+    /// The live recording. The app owns it, so it continues on every screen and case.
+    recording: Entity<Recording>,
     search: Entity<InputState>,
     /// The trimmed search text. While it is not empty, the list shows the search hits.
     query: String,
@@ -166,9 +168,14 @@ impl FilesView {
     ) -> Self {
         let store = Arc::new(Mutex::new(store));
         let case_select = cx.new(|cx| SelectState::new(Vec::<CaseItem>::new(), None, window, cx));
-        let hearings = cx.new(|cx| HearingsView::new(store.clone(), hearings_env, window, cx));
+        let recording = Recording::install(store.clone(), &hearings_env, cx);
+        let hearings = cx.new(|cx| {
+            HearingsView::new(store.clone(), hearings_env, recording.clone(), window, cx)
+        });
+        hearings::register_actions(&recording, hearings.downgrade(), cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar en las pruebas…"));
         let subscriptions = vec![
+            cx.observe(&recording, |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &case_select,
                 window,
@@ -230,6 +237,7 @@ impl FilesView {
             case_select,
             screen: Screen::Evidence,
             hearings,
+            recording,
             search,
             query: String::new(),
             groups: Vec::new(),
@@ -1042,10 +1050,45 @@ impl FilesView {
             .test_support()
     }
 
-    /// The row under the top navigation for the controls of a live hearing. The hearings layer
-    /// fills it; without a live hearing it shows nothing.
-    fn render_live_strip(&self, _: &mut Context<Self>) -> Option<AnyElement> {
-        None
+    /// The row under the top navigation for the controls of a live hearing, on both screens.
+    /// It follows the live hearing, not the selected case. Without a live hearing it shows
+    /// nothing.
+    fn render_live_strip(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let recording = self.recording.read(cx);
+        let elsewhere = recording.live().is_some_and(|live| {
+            self.screen != Screen::Hearings
+                || self.case_id != Some(live.case_id)
+                || self.hearings.read(cx).selected() != Some(live.hearing_id)
+        });
+        let view = cx.entity().downgrade();
+        let on_return = elsewhere.then(|| {
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| this.return_to_live(window, cx))
+                    .ok();
+            }) as hearings::OnReturn
+        });
+        hearings::render_live_strip(&self.recording, on_return, window, cx)
+    }
+
+    /// Shows the live hearing: its case, the hearings screen, and the hearing.
+    fn return_to_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((case_id, hearing_id)) = self
+            .recording
+            .read(cx)
+            .live()
+            .map(|live| (live.case_id, live.hearing_id))
+        else {
+            return;
+        };
+        self.open_case(case_id, window, cx);
+        self.case_select.update(cx, |select, cx| {
+            select.set_selected_value(&case_id, window, cx)
+        });
+        self.screen = Screen::Hearings;
+        self.hearings.update(cx, |hearings, cx| {
+            hearings.show_hearing(case_id, hearing_id, window, cx)
+        });
+        cx.notify();
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1676,7 +1719,7 @@ fn status_tag(status: AnalysisStatus) -> Tag {
 }
 
 impl Render for FilesView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = |id: &'static str, icon: IconName, title: &'static str, text: &'static str| {
             div()
                 .id(id)
@@ -1744,7 +1787,7 @@ impl Render for FilesView {
                 this.add_files(paths.paths().to_vec(), window, cx)
             }))
             .child(self.render_header(cx))
-            .children(self.render_live_strip(cx))
+            .children(self.render_live_strip(window, cx))
             .child(body)
     }
 }
@@ -1779,12 +1822,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        FilesView, Loaded, Tab, case_title, remove_open_copies, remove_open_copy, write_open_copy,
+        FilesView, Loaded, Screen, Tab, case_title, remove_open_copies, remove_open_copy,
+        write_open_copy,
     };
     use crate::audio::fake::FakeBackend;
     use crate::extract::{Page, PageSource};
     use crate::hearings::HearingsEnv;
-    use crate::models::ModelDirs;
+    use crate::models::{ModelDirs, NEMOTRON, SILERO_VAD, write_fake_model};
     use crate::store::{AnalysisStatus, Store};
 
     const WAIT: Duration = Duration::from_secs(1);
@@ -1799,6 +1843,14 @@ mod tests {
             },
             data_dir: dir.join("data"),
         };
+        open_with(store, env, cx)
+    }
+
+    fn open_with(
+        store: Store,
+        env: HearingsEnv,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<FilesView>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             let options = WindowOptions {
@@ -2450,6 +2502,99 @@ mod tests {
             assert!(window.try_find("list-skeleton").is_none());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn the_live_strip_stays_with_the_live_hearing_on_every_case_and_screen(
+        cx: &mut TestAppContext,
+    ) {
+        let store = Store::open_in_memory().unwrap();
+        let other = store.create_case("Otro caso").unwrap().id;
+        let case = store.create_case("Interbolsa").unwrap().id;
+        store.set_setting("last_case", &case.to_string()).unwrap();
+        let hearing = store
+            .create_hearing(case, "Audiencia 15/10/2026")
+            .unwrap()
+            .id;
+        let dir = temp_dir("live-strip");
+        let dirs = ModelDirs {
+            hf_cache: dir.join("hub"),
+            handy: dir.join("handy"),
+        };
+        fs::create_dir_all(&dirs.handy).unwrap();
+        write_fake_model(&dirs.handy.join(NEMOTRON.file), &NEMOTRON);
+        write_fake_model(&dirs.handy.join(SILERO_VAD.file), &SILERO_VAD);
+        let backend = FakeBackend::new("");
+        let env = HearingsEnv {
+            backend: Arc::new(backend.clone()),
+            model_dirs: dirs,
+            data_dir: dir.join("data"),
+        };
+        let (window, view) = open_with(store, env, cx);
+        let shown = |cx: &mut TestAppContext, id: &'static str| {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find(id).is_some()
+            })
+            .unwrap()
+        };
+
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find("screen-hearings").is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| window.click("screen-hearings", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |window, cx| {
+            window.try_find(("hearing", hearing as u64)).is_some()
+                && view.read(cx).hearings.read(cx).ready()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click(("hearing", hearing as u64), cx)
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| window.try_find("start").is_some())
+            .await;
+        cx.update_window(window, |_, window, cx| window.click("start", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |_, _| backend.input.lock().unwrap().is_some())
+            .await;
+        assert!(shown(cx, "live-strip"));
+        assert!(!shown(cx, "live-return"));
+
+        // An other case: the recording continues in its hearing, with its controls.
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.open_case(other, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        for id in ["live-strip", "speaker", "pause", "finish", "live-return"] {
+            assert!(shown(cx, id), "{id} is not shown");
+        }
+        cx.update(|cx| {
+            let recording = view.read(cx).recording.read(cx);
+            assert_eq!(recording.live_hearing(), Some(hearing));
+        });
+        assert!(backend.input.lock().unwrap().is_some());
+
+        // The evidence screen also shows the strip.
+        cx.update_window(window, |_, window, cx| window.click("screen-evidence", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(shown(cx, "finish"));
+
+        // Volver a la audiencia shows the case, the screen, and the hearing.
+        cx.update_window(window, |_, window, cx| window.click("live-return", cx))
+            .unwrap();
+        cx.wait_for(window, WAIT, |_, cx| {
+            let view = view.read(cx);
+            view.case_id == Some(case)
+                && view.screen == Screen::Hearings
+                && view.hearings.read(cx).selected() == Some(hearing)
+        })
+        .await;
+        assert!(!shown(cx, "live-return"));
     }
 
     #[gpui_kit::test]

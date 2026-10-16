@@ -25,6 +25,7 @@ actions!(nicolaw, [Quit]);
 fn install_menus(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    hearings::bind_keys(cx);
     cx.set_menus([Menu::new("Nicolaw").items([MenuItem::action("Salir", Quit)])]);
 }
 

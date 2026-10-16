@@ -253,4 +253,24 @@ mod tests {
             pages[0].text
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pdf_page_with_a_short_text_header_is_recognized_from_its_image() {
+        // One page: the text layer has only the header "Acta 7", and the body is a scanned image.
+        let pages = extract(
+            "header-scan.pdf",
+            "application/pdf",
+            &fixture("header-scan.pdf"),
+        )
+        .unwrap();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].source, PageSource::Ocr);
+        assert!(
+            contains_all(&pages[0].text, &["acta", "acusado", "marzo", "testigo"]),
+            "OCR text: {}",
+            pages[0].text
+        );
+    }
 }

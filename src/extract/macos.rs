@@ -13,7 +13,16 @@ use super::{ExtractError, Page, PageSource};
 /// A page without text is drawn at this scale before OCR, so that small text is legible.
 const OCR_SCALE: f64 = 2.0;
 
-/// The text of each page. A page without text goes through OCR.
+/// A PDF page with less text than this number of non-space characters also goes through OCR,
+/// so that a scanned body under a short text header is not lost.
+const MIN_TEXT_CHARS: usize = 20;
+
+/// The number of characters that are not white space.
+fn letters(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// The text of each page. A page with little or no text goes through OCR.
 pub fn pdf(bytes: &[u8]) -> Result<Vec<Page>, ExtractError> {
     autoreleasepool(|_| {
         let data = NSData::with_bytes(bytes);
@@ -36,7 +45,7 @@ pub fn pdf(bytes: &[u8]) -> Result<Vec<Page>, ExtractError> {
             let text = unsafe { page.string() }
                 .map(|text| text.to_string())
                 .unwrap_or_default();
-            if !text.trim().is_empty() {
+            if letters(&text) >= MIN_TEXT_CHARS {
                 pages.push(Page {
                     number,
                     text,
@@ -52,10 +61,20 @@ pub fn pdf(bytes: &[u8]) -> Result<Vec<Page>, ExtractError> {
             );
             let image = unsafe { page.thumbnailOfSize_forBox(size, PDFDisplayBox::MediaBox) };
             let tiff = image.TIFFRepresentation().ok_or(ExtractError::Ocr)?;
-            pages.push(Page {
-                number,
-                text: recognize(&tiff)?,
-                source: PageSource::Ocr,
+            let recognized = recognize(&tiff)?;
+            // The OCR of the drawn page also reads the text layer, so the longer text wins.
+            pages.push(if letters(&recognized) > letters(&text) {
+                Page {
+                    number,
+                    text: recognized,
+                    source: PageSource::Ocr,
+                }
+            } else {
+                Page {
+                    number,
+                    text,
+                    source: PageSource::Text,
+                }
             });
         }
         Ok(pages)

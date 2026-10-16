@@ -23,6 +23,8 @@ pub const BLOCK_SIZE: usize = 256 * 1024;
 /// the analysis. No release has version 3 yet, so its segment columns can still grow:
 /// [`Store::migrate`] adds the new columns to a database that a development build made.
 const SCHEMA_VERSION: i64 = 4;
+/// A question is the context of a statement only when it ends at most this long before it.
+pub const QUESTION_MAX_GAP_MS: i64 = 90_000;
 
 const SCHEMA_V2: &str = "
     DROP TABLE IF EXISTS files;
@@ -1024,7 +1026,10 @@ impl Store {
     }
 
     /// The text of the last final segment of an other speaker before `t_start_ms`: usually the
-    /// question that the accused answers.
+    /// question that the accused answers. The question must end at most
+    /// [`QUESTION_MAX_GAP_MS`] before the statement, and no final segment of the accused can be
+    /// between them. Else the statement has no question, so that an old question does not
+    /// change the meaning of a new statement.
     pub fn question_before(
         &self,
         hearing_id: i64,
@@ -1032,11 +1037,15 @@ impl Store {
     ) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT text FROM segments
-                 WHERE hearing_id = ?1 AND t_start_ms < ?2 AND speaker = 'other' AND final = 1
-                   AND failed = 0
-                 ORDER BY t_start_ms DESC, id DESC LIMIT 1",
-                params![hearing_id, t_start_ms],
+                "SELECT text FROM segments q
+                 WHERE q.hearing_id = ?1 AND q.t_start_ms < ?2 AND q.speaker = 'other'
+                   AND q.final = 1 AND q.failed = 0 AND q.t_end_ms >= ?2 - ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM segments a
+                       WHERE a.hearing_id = ?1 AND a.speaker = 'accused' AND a.final = 1
+                         AND a.t_start_ms > q.t_start_ms AND a.t_start_ms < ?2)
+                 ORDER BY q.t_start_ms DESC, q.id DESC LIMIT 1",
+                params![hearing_id, t_start_ms, QUESTION_MAX_GAP_MS],
                 |row| row.get(0),
             )
             .optional()
@@ -2292,11 +2301,32 @@ mod tests {
         assert_eq!(segment.text, "Estaba en Medellín.");
         assert_eq!(segment.speaker, Speaker::Accused);
         assert_eq!(
-            store.question_before(hearing, 3_000).unwrap().as_deref(),
+            store.question_before(hearing, 2_000).unwrap().as_deref(),
             Some("¿Dónde estaba el 12 de marzo?")
         );
+        // An answer of the accused is between the question and this statement.
+        assert_eq!(store.question_before(hearing, 3_000).unwrap(), None);
         assert_eq!(store.question_before(hearing, 0).unwrap(), None);
         assert!(store.segment(first + 100).is_err());
+    }
+
+    #[test]
+    fn a_question_more_than_90_seconds_before_the_statement_is_not_its_context() {
+        let (store, case) = store_with_case();
+        let hearing = store.create_hearing(case, "Audiencia").unwrap().id;
+        let add = |t: i64, speaker, text: &str| {
+            let id = store.insert_segment(hearing, t, speaker).unwrap();
+            store.finish_segment(id, text, t + 5_000).unwrap();
+            id
+        };
+        add(0, Speaker::Other, "¿Dónde estaba usted?");
+
+        // The question ends at 5 s.
+        assert_eq!(
+            store.question_before(hearing, 95_000).unwrap().as_deref(),
+            Some("¿Dónde estaba usted?")
+        );
+        assert_eq!(store.question_before(hearing, 95_001).unwrap(), None);
     }
 
     #[test]

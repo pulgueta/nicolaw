@@ -25,6 +25,7 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::tab::{self as tabs, TabBar};
 use gpui_kit::component::tag::Tag;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
@@ -35,13 +36,16 @@ use gpui_kit::*;
 use crate::analysis;
 use crate::extract::{Page, PageSource};
 use crate::preview::{self, Preview};
-use crate::store::{AnalysisStatus, Case, Evidence, ImportError, SearchHit, Store, file_name};
+use crate::store::{
+    AnalysisStatus, Case, Evidence, ImportError, SearchGroup, SearchHit, Store, file_name,
+    locator_label,
+};
 use crate::transfer::{Queue, State};
 
 /// The settings key of the last selected case.
 const LAST_CASE: &str = "last_case";
-/// The search shows at most this number of hits.
-const SEARCH_LIMIT: usize = 50;
+/// The search shows at most this number of hits for each file.
+const HITS_PER_GROUP: usize = 20;
 
 const LIST_ERROR: &str = "Nicolaw no puede leer las pruebas.";
 const DELETE_ERROR: &str = "Nicolaw no puede eliminar el archivo. Intente de nuevo.";
@@ -92,7 +96,12 @@ pub struct FilesView {
     search: Entity<InputState>,
     /// The trimmed search text. While it is not empty, the list shows the search hits.
     query: String,
-    hits: Vec<SearchHit>,
+    /// The search hits, grouped by file.
+    groups: Vec<SearchGroup>,
+    /// The files whose further hits show in the search list.
+    expanded: HashSet<i64>,
+    /// The chunk of the search hit that the user selected.
+    selected_hit: Option<i64>,
     search_task: Option<Task<()>>,
     files: Vec<Evidence>,
     selected: Option<i64>,
@@ -190,7 +199,9 @@ impl FilesView {
             case_select,
             search,
             query: String::new(),
-            hits: Vec::new(),
+            groups: Vec::new(),
+            expanded: HashSet::new(),
+            selected_hit: None,
             search_task: None,
             files: Vec::new(),
             selected: None,
@@ -247,7 +258,8 @@ impl FilesView {
         self.files.clear();
         self.clear_selection();
         self.query.clear();
-        self.hits.clear();
+        self.groups.clear();
+        self.expanded.clear();
         self.search_task = None;
         self.search
             .update(cx, |search, cx| search.set_value("", window, cx));
@@ -374,6 +386,7 @@ impl FilesView {
 
     fn clear_selection(&mut self) {
         self.selected = None;
+        self.selected_hit = None;
         self.preview_task = None;
         self.pages = None;
         self.pages_task = None;
@@ -590,10 +603,14 @@ impl FilesView {
     }
 
     fn run_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.query = query.trim().to_owned();
+        let query = query.trim().to_owned();
+        if query != self.query {
+            self.expanded.clear();
+        }
+        self.query = query;
         cx.notify();
         let Some(case_id) = self.case_id.filter(|_| !self.query.is_empty()) else {
-            self.hits.clear();
+            self.groups.clear();
             self.search_task = None;
             return;
         };
@@ -601,14 +618,17 @@ impl FilesView {
         let query = self.query.clone();
         // Replacing the task cancels the previous search.
         self.search_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let hits = cx
+            let groups = cx
                 .background_spawn(async move {
-                    store.lock().unwrap().search(case_id, &query, SEARCH_LIMIT)
+                    store
+                        .lock()
+                        .unwrap()
+                        .search_groups(case_id, &query, HITS_PER_GROUP)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                match hits {
-                    Ok(hits) => this.hits = hits,
+                match groups {
+                    Ok(groups) => this.groups = groups,
                     Err(_) => window.push_notification((NotificationType::Error, SEARCH_ERROR), cx),
                 }
                 cx.notify();
@@ -620,6 +640,7 @@ impl FilesView {
     /// Selects the evidence of the hit and shows its text at the page of the hit.
     fn open_hit(&mut self, hit: &SearchHit, window: &mut Window, cx: &mut Context<Self>) {
         self.select(hit.evidence_id, window, cx);
+        self.selected_hit = Some(hit.chunk_id);
         self.tab = Tab::Text;
         self.focus_page = Some(hit.page);
         self.scroll_to_focus_page();
@@ -874,7 +895,7 @@ impl FilesView {
         } else if self.query.is_empty() {
             list.children(self.render_transfers())
                 .children(self.render_rows(cx))
-        } else if self.hits.is_empty() {
+        } else if self.groups.is_empty() {
             list.child(
                 div()
                     .p_2()
@@ -883,7 +904,7 @@ impl FilesView {
                     .child(format!("No hay resultados para \"{}\".", self.query)),
             )
         } else {
-            list.children(self.render_hits(cx))
+            list.children(self.render_groups(cx))
         };
 
         div()
@@ -992,54 +1013,123 @@ impl FilesView {
             .collect()
     }
 
-    fn render_hits(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The search hits, one group for each file: the best hit, then the further hits on request.
+    fn render_groups(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let muted = cx.theme().muted_foreground;
-        let radius = cx.theme().radius;
-        self.hits
-            .iter()
-            .map(|hit| {
-                let open = hit.clone();
-                ListItem::new(("hit", hit.chunk_id as u64))
-                    .rounded(radius)
-                    .py_2()
-                    .selected(self.selected == Some(hit.evidence_id))
-                    .accessibility_label(format!("{}, página {}", hit.evidence_name, hit.page))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.open_hit(&open, window, cx)),
+        let mut rows = vec![
+            div()
+                .id("hit-count")
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(muted)
+                .child(files_with_hits(self.groups.len()))
+                .test_support()
+                .into_any_element(),
+        ];
+        for group in &self.groups {
+            let Some((best, more)) = group.hits.split_first() else {
+                continue;
+            };
+            rows.push(self.render_hit(group, best, true, cx));
+            let further = group.total - 1;
+            if further == 0 {
+                continue;
+            }
+            let id = group.evidence_id;
+            let expanded = self.expanded.contains(&id);
+            if expanded {
+                rows.extend(
+                    more.iter()
+                        .map(|hit| self.render_hit(group, hit, false, cx)),
+                );
+            }
+            let summary = if expanded && group.total > group.hits.len() {
+                format!(
+                    "Se muestran {} de {} pasajes.",
+                    group.hits.len(),
+                    group.total
+                )
+            } else {
+                more_passages(further)
+            };
+            rows.push(
+                h_flex()
+                    .pl_4()
+                    .pr_2()
+                    .gap_2()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(summary)
+                    .child(
+                        Button::new(("more", id as u64))
+                            .ghost()
+                            .xsmall()
+                            .label(if expanded {
+                                "Ver menos pasajes"
+                            } else {
+                                "Ver más pasajes"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.expanded.remove(&id) {
+                                    this.expanded.insert(id);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    /// One search hit. The best hit of a file shows the file name; a further hit is indented.
+    fn render_hit(
+        &self,
+        group: &SearchGroup,
+        hit: &SearchHit,
+        best: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let locator = locator_label(&group.mime, hit.page);
+        let open = hit.clone();
+        ListItem::new(("hit", hit.chunk_id as u64))
+            .rounded(cx.theme().radius)
+            .py_2()
+            .when(!best, |item| item.pl_6())
+            .selected(self.selected_hit == Some(hit.chunk_id))
+            .accessibility_label(format!(
+                "{}, {}",
+                group.evidence_name,
+                locator.to_lowercase()
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| this.open_hit(&open, window, cx)))
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_between()
+                            .when(best, |row| {
+                                row.child(file_name_label(
+                                    ("hit-name", hit.chunk_id as u64),
+                                    &group.evidence_name,
+                                ))
+                            })
+                            .child(div().flex_none().text_xs().text_color(muted).child(locator)),
                     )
                     .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(hit.evidence_name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child(format!("Página {}", hit.page)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .line_clamp(3)
-                                    .child(hit.snippet.clone()),
-                            ),
-                    )
-                    .into_any_element()
-            })
-            .collect()
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .line_clamp(3)
+                            .child(hit.snippet.clone()),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Placeholder rows until the first list arrives. Each row uses the list item and the
@@ -1310,6 +1400,34 @@ fn render_page(page: &Page, muted: Hsla) -> impl IntoElement {
         } else {
             div().text_sm().child(text.to_owned())
         })
+}
+
+/// A file name that takes the free width of its row. A long name is cut, and its tooltip shows
+/// the full name.
+fn file_name_label(id: impl Into<ElementId>, name: &str) -> Stateful<Div> {
+    let full: SharedString = name.to_owned().into();
+    div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .text_sm()
+        .truncate()
+        .child(full.clone())
+        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+}
+
+fn files_with_hits(count: usize) -> String {
+    match count {
+        1 => "1 archivo con coincidencias".to_owned(),
+        n => format!("{n} archivos con coincidencias"),
+    }
+}
+
+fn more_passages(count: usize) -> String {
+    match count {
+        1 => "1 pasaje más".to_owned(),
+        n => format!("{n} pasajes más"),
+    }
 }
 
 fn status_label(status: AnalysisStatus) -> &'static str {
@@ -1624,6 +1742,79 @@ mod tests {
             assert!(window.find(("page", 2u64)).visible());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn search_groups_hits_by_file_and_selects_only_the_chosen_hit(cx: &mut TestAppContext) {
+        let dir = temp_dir("grouped");
+        let (store, case) = store_with_case();
+        let page = |number: u32, text: &str| Page {
+            number,
+            text: text.into(),
+            source: PageSource::Text,
+        };
+        fs::write(dir.join("a.txt"), "x").unwrap();
+        fs::write(dir.join("b.txt"), "x").unwrap();
+        let a = store
+            .import(case, &dir.join("a.txt"), |_, _| {})
+            .unwrap()
+            .id;
+        let b = store
+            .import(case, &dir.join("b.txt"), |_, _| {})
+            .unwrap()
+            .id;
+        store
+            .save_analysis(
+                a,
+                &[page(1, "El testigo habló."), page(2, "Otro testigo llegó.")],
+            )
+            .unwrap();
+        store
+            .save_analysis(b, &[page(1, "El testigo vio el auto.")])
+            .unwrap();
+        let groups = store.search_groups(case, "testigo", 10).unwrap();
+        let group = |id: i64| groups.iter().find(|group| group.evidence_id == id).unwrap();
+        let (a_best, a_more) = (group(a).hits[0].clone(), group(a).hits[1].clone());
+        let b_best = group(b).hits[0].chunk_id;
+        let (window, view) = open(store, cx);
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("file", a as u64)).is_some()
+        })
+        .await;
+
+        cx.update_window(window, |_, window, cx| {
+            window.click("search", cx);
+            window.input("testigo", cx);
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hit", a_best.chunk_id as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.find("hit-count").visible());
+            assert!(window.try_find(("hit", b_best as u64)).is_some());
+            assert!(window.try_find(("hit", a_more.chunk_id as u64)).is_none());
+            assert!(window.try_find(("more", b as u64)).is_none());
+            window.click(("more", a as u64), cx);
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |window, _| {
+            window.try_find(("hit", a_more.chunk_id as u64)).is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click(("hit", a_more.chunk_id as u64), cx)
+        })
+        .unwrap();
+        cx.wait_for(window, WAIT, |_, cx| view.read(cx).selected == Some(a))
+            .await;
+
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.selected_hit, Some(a_more.chunk_id));
+            assert_eq!(view.tab, Tab::Text);
+        });
     }
 
     #[gpui_kit::test]

@@ -140,6 +140,18 @@ pub struct SearchHit {
     pub rank: f64,
 }
 
+/// The search hits of one evidence file, for the search list.
+#[derive(Clone, Debug)]
+pub struct SearchGroup {
+    pub evidence_id: i64,
+    pub evidence_name: String,
+    pub mime: String,
+    /// The best hits of the file, best first. The first hit is the best hit.
+    pub hits: Vec<SearchHit>,
+    /// The number of chunks of the file that match. It can be more than `hits.len()`.
+    pub total: usize,
+}
+
 #[derive(Debug)]
 pub enum ImportError {
     TooLarge,
@@ -411,8 +423,70 @@ impl Store {
             .collect()
     }
 
-    /// Full-text search in the evidence of one case, best match first. Accents and case do not
-    /// matter, and each word also matches as a prefix. Any user input is safe.
+    /// Full-text search in the evidence of one case, grouped by evidence file. The file with the
+    /// best hit is first. Each group has at most `hits_per_group` hits, best first, and the
+    /// number of all its hits, so that one file with many hits cannot hide the other files.
+    /// Accents and case do not matter, and each word also matches as a prefix. Any user input
+    /// is safe.
+    pub fn search_groups(
+        &self,
+        case_id: i64,
+        query: &str,
+        hits_per_group: usize,
+    ) -> rusqlite::Result<Vec<SearchGroup>> {
+        let Some(query) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let mut groups: Vec<SearchGroup> = Vec::new();
+        let mut statement = self.conn.prepare(
+            "WITH hits AS (
+                 SELECT c.evidence_id AS evidence_id, c.page AS page, c.id AS chunk_id,
+                        snippet(chunks_fts, 0, '', '', '…', 16) AS snippet,
+                        bm25(chunks_fts) AS rank
+                 FROM chunks_fts
+                 JOIN chunks c ON c.id = chunks_fts.rowid
+                 JOIN evidence e ON e.id = c.evidence_id
+                 WHERE chunks_fts MATCH ?1 AND e.case_id = ?2
+             ), numbered AS (
+                 SELECT *,
+                        row_number() OVER (PARTITION BY evidence_id ORDER BY rank, chunk_id) AS n,
+                        count(*) OVER (PARTITION BY evidence_id) AS total,
+                        min(rank) OVER (PARTITION BY evidence_id) AS best
+                 FROM hits
+             )
+             SELECT h.evidence_id, e.name, e.mime, h.page, h.chunk_id, h.snippet, h.rank, h.total
+             FROM numbered h JOIN evidence e ON e.id = h.evidence_id
+             WHERE h.n <= ?3
+             ORDER BY h.best, h.evidence_id, h.n",
+        )?;
+        let mut rows = statement.query(params![query, case_id, hits_per_group as i64])?;
+        while let Some(row) = rows.next()? {
+            let hit = SearchHit {
+                evidence_id: row.get(0)?,
+                evidence_name: row.get(1)?,
+                page: row.get(3)?,
+                chunk_id: row.get(4)?,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
+            };
+            match groups.last_mut() {
+                Some(group) if group.evidence_id == hit.evidence_id => group.hits.push(hit),
+                _ => groups.push(SearchGroup {
+                    evidence_id: hit.evidence_id,
+                    evidence_name: hit.evidence_name.clone(),
+                    mime: row.get(2)?,
+                    total: row.get::<_, i64>(7)? as usize,
+                    hits: vec![hit],
+                }),
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Full-text search in the evidence of one case, one chunk for each hit, best match first.
+    /// Accents and case do not matter, and each word also matches as a prefix. Any user input
+    /// is safe. The tests use it to find a chunk; the search list uses [`Self::search_groups`].
+    #[cfg(test)]
     pub fn search(
         &self,
         case_id: i64,
@@ -472,6 +546,11 @@ fn fts_query(query: &str) -> Option<String> {
         .map(|word| format!("\"{word}\"*"))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+/// The location of a page in an evidence file, for the user.
+pub fn locator_label(_mime: &str, page: u32) -> String {
+    format!("Página {page}")
 }
 
 /// The last part of `path`, used as the display name of the file.
@@ -756,6 +835,50 @@ mod tests {
         }
         assert_eq!(store.search(case, "\"acusado\"", 10).unwrap().len(), 1);
         assert!(store.search(case, "", 10).unwrap().is_empty());
+    }
+
+    /// A page of about 250 words with `word` once, so that one hit has a low BM25 score.
+    fn long_page_with(word: &str) -> String {
+        format!(
+            "{} {word}.",
+            "La audiencia continuó sin novedad en la sala. ".repeat(30)
+        )
+    }
+
+    #[test]
+    fn grouped_search_reaches_every_file_when_one_file_has_many_hits() {
+        let (store, case) = store_with_case();
+        let large = import(&store, case, &temp_file("grande.txt", b"x"));
+        store
+            .save_analysis(large, &[text_page(1, &"El testigo habló. ".repeat(20_000))])
+            .unwrap();
+        let mut small = Vec::new();
+        for n in 0..6 {
+            let id = import(&store, case, &temp_file(&format!("acta{n}.txt"), b"x"));
+            store
+                .save_analysis(id, &[text_page(1, &long_page_with("testigo"))])
+                .unwrap();
+            small.push(id);
+        }
+
+        let groups = store.search_groups(case, "testigo", 3).unwrap();
+
+        let ids: Vec<i64> = groups.iter().map(|group| group.evidence_id).collect();
+        assert_eq!(ids.len(), 7);
+        assert_eq!(ids[0], large);
+        for id in &small {
+            assert!(ids.contains(id), "{id} is missing");
+        }
+        assert_eq!(groups[0].evidence_name, "grande.txt");
+        assert_eq!(groups[0].mime, "text/plain");
+        assert_eq!(groups[0].hits.len(), 3);
+        assert!(groups[0].total > 50, "{}", groups[0].total);
+        assert!(groups[0].hits.windows(2).all(|w| w[0].rank <= w[1].rank));
+        for group in &groups[1..] {
+            assert_eq!((group.total, group.hits.len()), (1, 1));
+            assert!(groups[0].hits[0].rank <= group.hits[0].rank);
+        }
+        assert!(store.search_groups(case, "", 3).unwrap().is_empty());
     }
 
     #[test]
